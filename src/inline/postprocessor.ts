@@ -1,0 +1,108 @@
+/**
+ * Inline `` `sn1.xxxx` `` payloads in reading view.
+ *
+ * Rendered as a small lock pill. Clicking asks for the secret and shows the
+ * value in place; the file is untouched.
+ */
+
+import { MarkdownPostProcessorContext, Notice } from "obsidian";
+import type SealedNotePlugin from "../main";
+import { openInline } from "../core/format";
+import { describeError } from "../util/errors";
+
+const PAYLOAD_RE = /`?(sn1\.[A-Za-z0-9+/=]{40,})`?/g;
+
+export function registerInlinePayloads(plugin: SealedNotePlugin): void {
+  plugin.registerMarkdownPostProcessor(async (el, ctx) => {
+    if (!plugin.config().showInlineBadges) return;
+    await decorate(plugin, el, ctx);
+  });
+}
+
+async function decorate(
+  plugin: SealedNotePlugin,
+  el: HTMLElement,
+  ctx: MarkdownPostProcessorContext,
+): Promise<void> {
+  // Walk text nodes so we do not fight with the rest of the rendered DOM.
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) =>
+      node.nodeValue && PAYLOAD_RE.test(node.nodeValue)
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_SKIP,
+  });
+
+  const targets: Text[] = [];
+  let current = walker.nextNode();
+  while (current) {
+    targets.push(current as Text);
+    current = walker.nextNode();
+  }
+
+  for (const node of targets) {
+    const text = node.nodeValue ?? "";
+    PAYLOAD_RE.lastIndex = 0;
+    if (!PAYLOAD_RE.test(text)) continue;
+    PAYLOAD_RE.lastIndex = 0;
+
+    const fragment = document.createDocumentFragment();
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+    PAYLOAD_RE.lastIndex = 0;
+    while ((match = PAYLOAD_RE.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        fragment.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+      }
+      fragment.appendChild(buildPill(plugin, match[1], ctx));
+      lastIndex = match.index + match[0].length;
+    }
+    if (lastIndex < text.length) {
+      fragment.appendChild(document.createTextNode(text.slice(lastIndex)));
+    }
+    node.parentNode?.replaceChild(fragment, node);
+  }
+}
+
+function buildPill(
+  plugin: SealedNotePlugin,
+  payload: string,
+  ctx: MarkdownPostProcessorContext,
+): HTMLElement {
+  const pill = document.createElement("span");
+  pill.className = "sealed-pill";
+  pill.setText?.(`🔒 密文`);
+  pill.textContent = "🔒 密文";
+  pill.setAttribute("title", "点击解密");
+  pill.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      const dek = await plugin.unlockService.dekFor(ctx.sourcePath, {
+        subject: ctx.sourcePath.split("/").pop() ?? "",
+      });
+      if (!dek) return;
+      const plain = await openInline(dek, plugin.vaultId(), payload);
+      // Ctrl/Cmd click copies without ever painting the secret on screen.
+      if (event.ctrlKey || event.metaKey) {
+        await navigator.clipboard.writeText(plain);
+        plugin.clipboard.noteCopied();
+        new Notice("已复制到剪贴板（未显示在屏幕上）");
+        return;
+      }
+      pill.textContent = plain;
+      pill.classList.add("is-revealed");
+      pill.setAttribute("title", "点击隐藏");
+      pill.onclick = null;
+      pill.addEventListener("click", (e) => {
+        e.preventDefault();
+        if (pill.classList.contains("is-revealed")) {
+          pill.textContent = "🔒 密文";
+          pill.classList.remove("is-revealed");
+        }
+      });
+    } catch (error) {
+      new Notice(describeError(error), 6000);
+    }
+  });
+  return pill;
+}

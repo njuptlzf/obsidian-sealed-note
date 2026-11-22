@@ -1,0 +1,573 @@
+/**
+ * Localization.
+ *
+ * Pattern follows the local daily-report plugin, which is itself the de-facto
+ * Obsidian convention:
+ *
+ *   - settings key `language`: "auto" | "en" | "zh"
+ *   - two flat dictionaries keyed by dotted names, e.g. "cmd.create.name"
+ *   - "auto" resolves via Obsidian's getLanguage() (zh* -> zh, else en)
+ *   - t(key, vars) substitutes {name} placeholders, falls back to English,
+ *     then to the key itself so a missing translation is loud but harmless
+ *
+ * All user-facing strings go through t(). Error messages created inside core/
+ * are the deliberate exception: they are already typed and mapped to readable
+ * text at the UI boundary.
+ */
+
+import { getLanguage } from "obsidian";
+
+export type Language = "auto" | "en" | "zh";
+export type ResolvedLanguage = "en" | "zh";
+
+const en: Record<string, string> = {
+  // ---- commands ----
+  "cmd.new.name": "New private note",
+  "note.defaultName": "Private note",
+  "cmd.encrypt.fence.name": "Encrypt selection (as block)",
+  "cmd.encrypt.inline.name": "Encrypt selection (inline)",
+  "cmd.decrypt.name": "Decrypt selection",
+  "cmd.decrypt.clipboard.name": "Decrypt selection to clipboard (do not show)",
+  "cmd.decrypt.whole.name": "Decrypt whole note",
+  "cmd.lock.name": "Lock current note",
+  "cmd.lockAll.name": "Lock all",
+  "cmd.recovery.name": "View / regenerate recovery key",
+  "cmd.rebuild.name": "Rebuild keyring from a note (when lost)",
+  "cmd.refreshCopies.name": "Refresh key copies in all notes",
+  "cmd.totp.name": "Configure two-factor authentication",
+  "cmd.settings.name": "Open encryption settings",
+
+  // ---- notices ----
+  "notice.created": "Private note created. Only ciphertext is written to disk.",
+  "notice.locked": "Locked",
+  "notice.lockedCount": "Locked {n} note(s)",
+  "notice.noUnlocked": "No notes are currently unlocked",
+  "notice.noSelection": "Select the content to encrypt first",
+  "notice.encryptedFence": "Encrypted as a block",
+  "notice.encryptedInline": "Encrypted as inline ciphertext",
+  "notice.decrypted": "Selection decrypted. Saving now writes plaintext.",
+  "notice.copied": "Copied to clipboard. The clipboard is shared.",
+  "notice.copiedAuto": "Copied. Clipboard will be cleared in {n}s if unchanged.",
+  "notice.notSealed": "This is not a private note",
+  "notice.decryptConfirmBody":
+    "This creates a plaintext .md copy. Plaintext enters the search index, graph and sync history.\n\nThe original private note is kept and will not be deleted.",
+  "notice.decryptConfirmOk": "Create plaintext copy",
+  "notice.plainCreated": "Plaintext copy created: {path}",
+  "notice.recoveryRegenTitle": "Regenerate recovery key?",
+  "notice.recoveryRegenBody":
+    "The previous recovery key will stop working immediately. Only do this if it leaked or was never saved.",
+  "notice.recoveryRegenOk": "Generate new recovery key",
+  "notice.recoveryDone": "Recovery key updated. The old one is no longer valid.",
+  "notice.recoverySaved": "Setup complete. Keep your recovery key safe - it is the only way back.",
+  "notice.recoveryNotSaved":
+    "You did not confirm saving the recovery key. Go to settings and generate one immediately.",
+  "notice.totpDone": "Enabled. The seed lives only in your authenticator; import its otpauth URI on another device.",
+  "notice.totpExists": "Two-factor authentication is already configured. Disable it first to change.",
+  "notice.modePassword": "Switched to password-only mode",
+  "notice.passwordChanged": "Password changed. No note content was re-encrypted.",
+  "notice.passwordChangedPartial":
+    "Password changed, but {n} note(s) failed to refresh their key copy. Notes still open via the password; re-run Refresh key copies.",
+  "notice.copiesRefreshed":
+    "Key copies refreshed: {updated} updated, {current} already current, {without} old-format notes, {failed} failed.",
+  "notice.noCandidates": "No notes with a key copy were found. They may predate this feature or be deleted.",
+  "notice.rebuilt": "Keyring rebuilt from {source} (generation {epoch}, slot {slot}). All notes are readable again.",
+  "notice.keyringExistsTitle": "Keyring already exists. Rebuild anyway?",
+  "notice.keyringExistsBody": "The current keyring will be backed up first. Only continue if it cannot unlock your notes.",
+  "notice.keyringExistsOk": "Continue rebuild",
+
+  // ---- prompts ----
+  "prompt.unlock": "Unlock",
+  "prompt.unlockTitle": "Unlock \"{name}\"",
+  "prompt.cancel": "Cancel",
+  "prompt.enter": "Unlock",
+  "prompt.required": "Please fill in {field}",
+  "prompt.seedHint": "Paste the otpauth:// URI from your authenticator (kept in memory for this session only):",
+  "prompt.seedRemembered": "Seed imported for this session. Re-import after restarting Obsidian.",
+  "prompt.seedOptional": "Leave blank to use the seed stored on this device. Paste an otpauth:// URI only on a new device or when re-binding.",
+  "prompt.seedMissing": "No usable TOTP seed on this device. Unlock with the recovery key, then use Settings - Unlock method - Restore local seed cache.",
+  "prompt.codeRemaining": "Code refreshes every {n}s, {left}s remaining",
+
+  // ---- setup ----
+  "setup.title": "Set master password",
+  "setup.warning":
+    "The master password is never stored or synced. Only a recovery key can help if you forget it - nothing can recover the password itself.",
+  "setup.password": "Master password",
+  "setup.passwordDesc": "At least 10 characters. A sentence only you know is a good choice.",
+  "setup.confirm": "Confirm password",
+  "setup.hint": "Password hint (optional, stored in plaintext)",
+  "setup.hintDesc": "A hint is public. Do not write the password or a variation of it.",
+  "setup.next": "Next: generate recovery key",
+  "setup.weak": "Strength: weak. An offline attack is faster than you think.",
+  "setup.ok": "Strength: good",
+  "setup.need10": "At least 10 characters",
+  "setup.mismatch": "Passwords do not match",
+
+  // ---- recovery key ----
+  "recovery.title": "Save your recovery key",
+  "recovery.warning":
+    "This is the only thing that can rescue your notes. If you forget the password, it resets it - the password itself cannot be recovered by anything.",
+  "recovery.copy": "Copy",
+  "recovery.download": "Download as text file",
+  "recovery.ack":
+    "I have saved the recovery key offline and understand that losing it along with the password means permanent data loss",
+  "recovery.done": "Done",
+  "recovery.copied": "Recovery key copied. Save it somewhere safe, then clear your clipboard.",
+
+  // ---- TOTP ----
+  "totp.title": "Set up two-factor authentication",
+  "totp.warning":
+    "The seed lives only in your authenticator app. The plugin never stores it on disk or in notes. To use another computer, export the otpauth URI from the app and paste it in the unlock dialog.",
+  "totp.scan": "1. Scan this QR code with your authenticator (Authy, Google Authenticator, 1Password):",
+  "totp.manual": "Or enter this key manually:",
+  "totp.copyKey": "Copy key",
+  "totp.keyCopied": "TOTP seed copied",
+  "totp.qrFailed": "Could not generate QR. Add the key manually.",
+  "totp.uriHint": "Or paste this URI into an app that supports import:",
+  "totp.verify": "2. Enter the current 6-digit code to confirm:",
+  "totp.badCode": "Wrong code. Check your device clock and wait for the next code.",
+  "totp.enable": "Enable",
+  "totp.qrAlt": "Authenticator QR",
+
+  // ---- mode selection ----
+  "mode.title": "Choose an unlock method",
+  "mode.hint":
+    "The key material is the 160-bit seed in your authenticator, not the rotating 6-digit code. On another device, export the otpauth URI from the app.",
+  "mode.both.title": "Password + TOTP (recommended)",
+  "mode.both.desc": "Both are required. Password + recovery key still works on a new device.",
+  "mode.password.title": "Password only",
+  "mode.password.desc": "Simplest experience. Security depends entirely on password strength.",
+  "mode.totp.title": "TOTP only",
+  "mode.totp.desc": "Only the 6-digit code. The key material stays in your authenticator, not in notes or on this device.",
+  "mode.set": "Set up",
+  "mode.switch": "Switch",
+  "mode.confirmPw": "Confirm master password (combined with TOTP)",
+
+  // ---- settings ----
+  "settings.status": "Key status",
+  "settings.language": "Language",
+  "settings.languageDesc": "Interface language",
+  "settings.noKey": "No master password yet. The setup wizard runs when you create your first private note.",
+  "settings.setupNow": "Set up now",
+  "settings.password": "Master password",
+  "settings.recovery": "Recovery key",
+  "settings.recoveryDesc": "Configured - make sure it is stored offline",
+  "settings.recoveryMissing": "Not configured - generate one now",
+  "settings.regenerate": "Regenerate",
+  "settings.totp": "Unlock method",
+  "settings.totpDesc": "Current mode: {mode}. The seed lives only in your authenticator app.",
+  "settings.totpOff": "Not enabled. Current mode: {mode}",
+  "settings.change": "Change",
+  "settings.configure": "Configure",
+  "settings.mode.password": "Password only",
+  "settings.mode.totp": "TOTP only",
+  "settings.mode.both": "Password + TOTP",
+  "settings.totpHint":
+    "On another computer: export the otpauth URI from your authenticator and paste it in the unlock dialog. The recovery key and TOTP seed are two independent paths.",
+  "settings.fingerprint": "Key fingerprint",
+  "settings.fingerprintDesc": "Compare after unlocking to confirm you hold the same key",
+  "settings.calculate": "Calculate",
+  "settings.keyringNote":
+    "There is no keyring file. The wrapped key lives in every private note and syncs with them.",
+  "settings.rebuild": "Rebuild keyring from note",
+  "settings.rebuildDesc":
+    "Every private note carries a key copy. Use this when the keyring is missing or no note will unlock.",
+  "settings.rebuildButton": "Rebuild",
+  "settings.securityNoticeTitle": "About password recovery, plainly: ",
+  "settings.securityNotice":
+    "The master password is never stored or synced, so it cannot be recovered - no tool can do that. Use the recovery key to reset it and your notes stay intact. Lose both and the data is gone permanently.",
+  "settings.sectionNotes": "Notes",
+  "settings.sectionUnlock": "Unlock and lock",
+  "settings.sectionAdvanced": "Advanced",
+  "settings.showBadges": "Show inline ciphertext badges",
+  "settings.showBadgesDesc": "Render sn1.… as a 🔒 pill instead of raw ciphertext in reading view.",
+  "settings.confirmDecrypt": "Confirm before decrypting a whole note",
+  "settings.confirmDecryptDesc": "Prevents accidentally writing plaintext into the search index and sync history.",
+  "settings.keep": "Keep unlocked for",
+  "settings.keepDesc": "0 means lock immediately when you leave a note and ask again on return.",
+  "settings.keep0": "Ask every time (most secure)",
+  "settings.keep60": "Keep for 1 minute",
+  "settings.keep300": "Keep for 5 minutes",
+  "settings.keep900": "Keep for 15 minutes",
+  "settings.lockBlur": "Lock all when the window loses focus",
+  "settings.lockBlurDesc": "Useful on a shared computer.",
+  "settings.defaultProvider": "Default unlock method",
+  "settings.defaultProviderDesc": "Other methods remain available in the dialog.",
+  "settings.clipboard": "Clear clipboard after copying",
+  "settings.clipboardDesc": "Only clears if you have not copied anything else since.",
+  "settings.clip0": "Never",
+  "settings.clip30": "After 30 seconds",
+  "settings.clip60": "After 60 seconds",
+  "settings.clip120": "After 2 minutes",
+  "settings.offlineTitle": "Offline decryption tool",
+  "settings.offlineDesc": "A standalone decrypt.html lives in the plugin directory. Open it directly in a browser.",
+  "settings.lockAll": "Lock all",
+  "settings.lockAllDesc": "Immediately clear every key from memory.",
+
+  // ---- misc / errors ----
+  "error.notInit": "No master password yet. Complete setup first",
+  "error.badEnvelope": "Not a valid encrypted note, or damaged by another tool",
+  "error.keyringMissing": "Keyring not found",
+  "error.wrongSecret": "Incorrect key",
+  "error.weakPassword": "Password is too weak",
+  "error.totpDevice": "No usable TOTP seed on this device (new device, or local app data was cleared). Paste the otpauth:// URI from your authenticator in the unlock dialog to restore the SAME seed without touching your phone. Or unlock with the recovery key and re-bind a new seed.",
+  "status.locked": "Locked",
+  "status.unlocked": "Unlocked {n}",
+  "misc.unlockContinue": "Unlock to continue",
+  "misc.recoveryNotSavedLong": "You did not confirm saving the recovery key. The keyring was created; generate and save one immediately in settings.",
+  "menu.encrypt": "Encrypt selection",
+  "menu.decryptClipboard": "Decrypt selection to clipboard",
+  "menu.lockNote": "Lock this note",
+  "menu.decryptWhole": "Decrypt whole note (to plaintext .md)",
+  "status.clickLockAll": "Click to lock all",
+  "menu.unlock": "Unlock",
+  "menu.decryptWholeTitle": "Decrypt whole note?",
+  "prompt.recovery": "Enter master password or recovery key",
+  "prompt.recoveryDesc": "Verify that the rebuilt keyring really opens your notes. Nothing is written until this succeeds.",
+  "notice.alreadyEncrypted": "This note is already encrypted as a whole; no need to encrypt parts of it",
+  "notice.noSelectionDecrypt": "Select the content to decrypt first",
+  "notice.decryptCopied": "Decrypted and copied",
+  "settings.notSet": "Not set",
+  "settings.modify": "Modify",
+  "settings.newPassword": "Set a new master password",
+  "settings.hintExample": "e.g. a line from a poem you know",
+  "settings.strengthMedium": "Strength: fair.",
+  "recovery.fingerprint": "Key fingerprint: {fp}",
+  "recovery.fileTitle": "Sealed Note recovery key",
+  "recovery.fileUse": "Use this to reset the master password if forgotten. Your notes stay intact.",
+  "recovery.fileWarn": "Anyone holding this string can open your encrypted notes. Store it offline.",
+  "picker.title": "Choose a note to restore from",
+  "picker.desc": "Every note here carries a wrapped copy of the same key. Any one restores the whole vault. Sorted newest first.",
+  "picker.use": "Use this one",
+  "picker.verify": "Verify and rebuild",
+  "prompt.enterContent": "Please enter something",
+  "totp.wrongCodeShort": "Please enter 6 digits",
+  "mode.bothDesc2": "Both are required. Password + recovery key still works on a new device.",
+  "common.ok": "OK",
+  "common.min10": "At least 10 characters",
+  "status.noneUnlocked2": "No unlocked notes",
+  "status.clickLockAll2": "Click to lock all",
+  "confirm.decryptBody2": "This creates a plaintext .md copy. Plaintext enters the search index, graph and sync history.\n\nThe original private note is kept and will not be deleted.",
+  "confirm.keyringBody2": "The current keyring will be backed up first. Only continue if it cannot unlock your notes.",
+  "confirm.recoveryBody2": "The previous recovery key will stop working immediately. Only do this if it leaked or was never saved.",
+  "settings.changePassword": "Change master password",
+  "settings.totpHintA": "On another computer: export the otpauth URI from your authenticator and paste it in the unlock dialog. ",
+  "settings.totpHintB": "The recovery key and the TOTP seed are two independent paths.",
+  "settings.securityLong": "The master password is never stored or synced, so it cannot be recovered - any tool claiming otherwise is lying. Use the recovery key to reset it and your notes stay intact. Lose both and the data is gone.",
+  "settings.offlineName": "Offline decryption tool",
+  "settings.offlineDesc2": "A single-file decrypt.html lives in the plugin directory, usable directly in a browser.",
+  "settings.info": "Info",
+  "settings.infoBody": "The offline tool is tools/decrypt.html in the plugin directory; open it in a browser.",
+  "common.lock": "Lock",
+  "common.min10Desc": "At least 10 characters. Changing the password only rewraps the key; notes are not re-encrypted.",
+  "setup.caution2": "The master password is never stored or synced. Only a recovery key can help if you forget it - nothing can recover the password itself.",
+  "totp.warningA": "The seed lives only in your authenticator app. The plugin never stores it on disk or in notes.",
+  "totp.warningB": "On another computer, export the otpauth URI from the app and paste it in the unlock dialog. Back up the link below offline.",
+  "seedImport.title": "Restore local TOTP seed",
+  "seedImport.desc": "Paste the otpauth:// URI exported from your authenticator. This restores the SAME seed - your phone and 6 digit codes stay unchanged.",
+  "seedImport.steps": "Use this after a new computer, or after clearing this app's local data. No need to re-scan a QR or change your seed.",
+  "seedImport.import": "Import",
+  "seedImport.invalid": "Must start with otpauth://",
+  "seedImport.ok": "Local seed restored. This device will now unlock with just the 6 digit code.",
+  "seedImport.rebindHint": "Lost the seed on your phone too? Unlock with the recovery key, then use 'Change' to bind a brand new seed.",
+  "settings.importSeed": "Restore local seed cache",
+  "settings.importSeedDesc": "New computer, or local app data was cleared? Paste the otpauth URI from your authenticator to restore the same seed without re-scanning.",
+
+};
+
+const zh: Record<string, string> = {
+  // ---- commands ----
+  "cmd.new.name": "新建隐私笔记",
+  "note.defaultName": "隐私笔记",
+  "cmd.encrypt.fence.name": "加密所选内容（为加密块）",
+  "cmd.encrypt.inline.name": "加密所选内容（行内密文）",
+  "cmd.decrypt.name": "解密所选内容",
+  "cmd.decrypt.clipboard.name": "解密所选内容到剪贴板（不显示在屏幕上）",
+  "cmd.decrypt.whole.name": "解密整个文档",
+  "cmd.lock.name": "锁定当前笔记",
+  "cmd.lockAll.name": "锁定全部",
+  "cmd.recovery.name": "查看/重新生成恢复密钥",
+  "cmd.rebuild.name": "从加密笔记恢复密钥库（密钥库丢失时用）",
+  "cmd.refreshCopies.name": "刷新所有加密笔记里的密钥副本",
+  "cmd.totp.name": "设置动态密码（两步验证）",
+  "cmd.settings.name": "打开加密设置",
+
+  // ---- notices ----
+  "notice.created": "隐私笔记已创建。保存后磁盘上只有密文。",
+  "notice.locked": "已锁定",
+  "notice.lockedCount": "已锁定 {n} 篇笔记",
+  "notice.noUnlocked": "当前没有已解锁的笔记",
+  "notice.noSelection": "先选中要加密的内容",
+  "notice.encryptedFence": "已加密为加密块",
+  "notice.encryptedInline": "已加密为行内密文",
+  "notice.decrypted": "已解密所选内容。注意：保存后这部分就是明文了。",
+  "notice.copied": "已复制到剪贴板。注意：剪贴板是共享的。",
+  "notice.copiedAuto": "已复制。{n} 秒后若未再复制其他内容会自动清空。",
+  "notice.notSealed": "这不是隐私笔记",
+  "notice.decryptConfirmBody":
+    "这会创建一份明文 .md 副本。明文会进入搜索索引、图谱和同步历史。\n\n原隐私笔记会保留，不会自动删除。",
+  "notice.decryptConfirmOk": "创建明文副本",
+  "notice.plainCreated": "已创建明文副本：{path}",
+  "notice.recoveryRegenTitle": "重新生成恢复密钥？",
+  "notice.recoveryRegenBody":
+    "之前的恢复密钥会立刻失效，任何用它保存的备份都将无法重设密码。\n\n只有在你确认旧密钥已经泄露，或者从未保存过它时，才应该这样做。",
+  "notice.recoveryRegenOk": "生成新的恢复密钥",
+  "notice.recoveryDone": "恢复密钥已更新。旧密钥已失效。",
+  "notice.recoverySaved": "设置完成。恢复密钥是你忘记密码时唯一的救生索，请妥善保管。",
+  "notice.recoveryNotSaved": "你没有确认已保存恢复密钥。请立刻到设置里重新生成并保存。",
+  "notice.totpDone": "已启用。种子只保存在你的验证器里；换设备时从验证器导出 otpauth 链接导入即可。",
+  "notice.totpExists": "动态密码已经设置过了。如需更换，请先在设置里关闭再重新设置。",
+  "notice.modePassword": "已切换为纯主密码模式",
+  "notice.passwordChanged": "主密码已更新。所有笔记无需重新加密。",
+  "notice.passwordChangedPartial":
+    "主密码已更新，但 {n} 篇笔记的副本刷新失败。笔记仍可用新密码打开；请重跑「刷新所有加密笔记里的密钥副本」。",
+  "notice.copiesRefreshed":
+    "密钥副本刷新完成：{updated} 篇已更新，{current} 篇已是最新，{without} 篇是旧格式、没有密钥副本，{failed} 篇失败。",
+  "notice.noCandidates": "没有找到携带密钥副本的笔记。这只可能是以下情况：笔记由旧版本创建、或笔记已被删除。",
+  "notice.rebuilt": "密钥库已从「{source}」重建（第 {epoch} 代，匹配 {slot} 槽）。现在可以打开所有笔记了。",
+  "notice.keyringExistsTitle": "密钥库已存在，仍要从笔记重建？",
+  "notice.keyringExistsBody": "现有密钥库会被覆盖，并先备份到 backups/ 目录。\n\n只有在你确定当前密钥库无法解锁时才需要这样做。",
+  "notice.keyringExistsOk": "继续重建",
+
+  // ---- prompts ----
+  "prompt.unlock": "解锁",
+  "prompt.unlockTitle": "解锁「{name}」",
+  "prompt.cancel": "取消",
+  "prompt.enter": "解锁",
+  "prompt.required": "请填写{field}",
+  "prompt.seedHint": "粘贴验证器导出的 otpauth:// 链接（种子只保存在本次会话的内存里，不写盘）：",
+  "prompt.seedRemembered": "本次会话已导入验证器种子。",
+  "prompt.seedOptional": "留空即使用本机保存的种子。只有换新设备、或需要重新绑定时，才粘贴验证器导出的 otpauth:// 链接。",
+  "prompt.seedMissing": "这台设备上没有可用的动态密码种子。请用恢复密钥解锁，然后到【设置 → 解锁方式 → 恢复本机种子缓存】粘贴验证器导出的链接。",
+  "prompt.codeRemaining": "验证码每 {n} 秒刷新，当前剩余 {left} 秒",
+
+  // ---- setup ----
+  "setup.title": "设置主密码",
+  "setup.warning":
+    "主密码不会保存在任何设备上，也不会被同步。忘记密码时，只有恢复密钥能救你——没有任何工具能找回密码。",
+  "setup.password": "主密码",
+  "setup.passwordDesc": "至少 10 个字符。建议用一句只有你记得的长句子。",
+  "setup.confirm": "再输一次",
+  "setup.hint": "密码提示（可选，会明文保存）",
+  "setup.hintDesc": "提示是公开的。不要写密码本身或其变形。",
+  "setup.next": "下一步：生成恢复密钥",
+  "setup.weak": "强度：偏弱。离线爆破能比你想的更快。",
+  "setup.ok": "强度：不错。",
+  "setup.need10": "主密码至少需要 10 个字符",
+  "setup.mismatch": "两次输入不一致",
+
+  // ---- recovery key ----
+  "recovery.title": "保存你的恢复密钥",
+  "recovery.warning":
+    "这是唯一能救回你笔记的东西。忘记主密码时用它重设——密码本身无法找回，任何工具都做不到。",
+  "recovery.copy": "复制",
+  "recovery.download": "下载为文本文件",
+  "recovery.ack": "我已把恢复密钥保存在离线的地方，并理解丢失它和密码将无法恢复数据",
+  "recovery.done": "完成",
+  "recovery.copied": "已复制恢复密钥。请立刻粘贴到安全的地方，然后清空剪贴板。",
+
+  // ---- TOTP ----
+  "totp.title": "设置动态密码",
+  "totp.warning":
+    "种子只在你的验证器 App 里。插件不保存它、不写盘、也不放进笔记。换电脑时，从验证器导出 otpauth 链接并在解锁框里粘贴即可。请把下面的链接离线备份。",
+  "totp.scan": "1. 用身份验证器（Authy、Google Authenticator、1Password 等）扫描下面的二维码：",
+  "totp.manual": "或者手动输入这个密钥：",
+  "totp.copyKey": "复制密钥",
+  "totp.keyCopied": "已复制动态密码种子",
+  "totp.qrFailed": "二维码生成失败，请用下面的密钥手动添加",
+  "totp.uriHint": "也可以直接粘贴下面的链接（otpauth://）到支持导入的验证器：",
+  "totp.verify": "2. 输入验证器当前显示的 6 位数字，确认已经绑定成功：",
+  "totp.badCode": "验证码不正确。请确认设备时间是否准确，然后等下一个验证码重试。",
+  "totp.enable": "启用",
+  "totp.qrAlt": "动态密码配置二维码",
+
+  // ---- mode selection ----
+  "mode.title": "选择解锁方式",
+  "mode.hint":
+    "动态密码的密钥材料是验证器 App 里的种子（160 位），不是每 30 秒变化的 6 位码。换设备时从验证器导出 otpauth 链接导入即可。",
+  "mode.both.title": "密码 + 动态密码（推荐）",
+  "mode.both.desc": "两把钥匙缺一不可。换设备时主密码 + 恢复密钥仍可进入。",
+  "mode.password.title": "纯主密码",
+  "mode.password.desc": "只输主密码。体验最简单，安全性取决于密码强度。",
+  "mode.totp.title": "纯动态密码",
+  "mode.totp.desc": "只用验证器的 6 位码。密钥材料是验证器里的种子，不在笔记也不在本机。",
+  "mode.set": "设置",
+  "mode.switch": "切换",
+  "mode.confirmPw": "确认主密码（用于组合解锁）",
+
+  // ---- settings ----
+  "settings.status": "密钥状态",
+  "settings.language": "界面语言",
+  "settings.languageDesc": "选择插件界面的显示语言",
+  "settings.noKey": "还没有设置主密码。创建第一篇隐私笔记时会引导你完成设置。",
+  "settings.setupNow": "立即设置",
+  "settings.password": "主密码",
+  "settings.recovery": "恢复密钥",
+  "settings.recoveryDesc": "已设置 · 请确认它在离线的地方",
+  "settings.recoveryMissing": "未设置——强烈建议立刻生成",
+  "settings.regenerate": "重新生成",
+  "settings.totp": "解锁方式",
+  "settings.totpDesc": "当前模式：{mode}。种子只保存在你的验证器 App 里。",
+  "settings.totpOff": "未启用。当前模式：{mode}",
+  "settings.change": "更改",
+  "settings.configure": "设置",
+  "settings.mode.password": "纯主密码",
+  "settings.mode.totp": "纯动态密码",
+  "settings.mode.both": "主密码 + 动态密码",
+  "settings.totpHint":
+    "换电脑时：在你的验证器 App 里导出 otpauth:// 链接，下次解锁时粘贴即可。忘记主密码时用恢复密钥重设；恢复密钥与验证器种子是两条独立的路。",
+  "settings.fingerprint": "密钥指纹",
+  "settings.fingerprintDesc": "解锁后可在弹窗里核对，确认拿到的是同一把钥匙",
+  "settings.calculate": "计算",
+  "settings.keyringNote":
+    "没有独立的密钥库文件。包裹后的密钥存在每篇加密笔记里，普通同步工具会自动带上它们。",
+  "settings.rebuild": "从笔记恢复密钥库",
+  "settings.rebuildDesc": "每篇加密笔记都内嵌了一份密钥副本。密钥库丢失、或所有笔记都打不开时，用它重建。",
+  "settings.rebuildButton": "恢复",
+  "settings.securityNoticeTitle": "关于密码找回，说清楚： ",
+  "settings.securityNotice":
+    "主密码不会保存在任何设备上，也不会被同步，因此无法被找回——任何工具都做不到。忘记密码时，用恢复密钥重设主密码即可，笔记不会丢失。恢复密钥也丢了，数据就永久无法解密。",
+  "settings.sectionNotes": "笔记",
+  "settings.sectionUnlock": "解锁与锁定",
+  "settings.sectionAdvanced": "高级",
+  "settings.showBadges": "显示行内密文标记",
+  "settings.showBadgesDesc": "在阅读视图里把 `sn1.…` 显示成 🔒 密文，而不是一长串乱码。",
+  "settings.confirmDecrypt": "解密整个文档前确认",
+  "settings.confirmDecryptDesc": "防止误操作把密文写成明文，从而进入搜索索引和同步历史。",
+  "settings.keep": "解锁后保持时间",
+  "settings.keepDesc": "0 表示离开笔记就锁定，重新打开需要再输一次密码。",
+  "settings.keep0": "每次都要输入（最安全）",
+  "settings.keep60": "保持 1 分钟",
+  "settings.keep300": "保持 5 分钟",
+  "settings.keep900": "保持 15 分钟",
+  "settings.lockBlur": "失去焦点时锁定全部",
+  "settings.lockBlurDesc": "切到别的应用就立刻锁定。适合经常在公共场合用电脑的情况。",
+  "settings.defaultProvider": "默认解锁方式",
+  "settings.defaultProviderDesc": "弹窗里仍可随时切换其它方式。",
+  "settings.clipboard": "复制后自动清空剪贴板",
+  "settings.clipboardDesc": "只在你没有再复制别的内容时才会清空，避免破坏后续的正常复制。",
+  "settings.clip0": "不清空",
+  "settings.clip30": "30 秒后",
+  "settings.clip60": "60 秒后",
+  "settings.clip120": "2 分钟后",
+  "settings.offlineTitle": "离线解密工具",
+  "settings.offlineDesc": "插件目录下有单文件 decrypt.html，可直接用浏览器打开。",
+  "settings.lockAll": "锁定全部",
+  "settings.lockAllDesc": "立刻清空内存里的所有密钥。",
+
+  // ---- misc / errors ----
+  "error.notInit": "还没有设置主密码，请先完成初始化",
+  "error.badEnvelope": "文件不是有效的加密笔记，或已被其他工具破坏",
+  "error.keyringMissing": "找不到密钥库，无法读取加密笔记",
+  "error.wrongSecret": "密钥不正确",
+  "error.weakPassword": "密码强度不够",
+  "error.totpDevice": "这台设备上没有可用的动态密码种子（可能换了电脑，或本机应用数据被清理）。在解锁框粘贴验证器导出的 otpauth:// 链接即可恢复【同一个种子】，手机不用动；或者用恢复密钥解锁后重新生成新种子并扫码绑定。",
+  "status.locked": "🔒 已锁定",
+  "status.unlocked": "🔓 已解锁 {n} 篇",
+  "misc.unlockContinue": "解锁以继续",
+  "misc.recoveryNotSavedLong": "你没有确认已保存恢复密钥。密钥库已经创建，请立刻到设置里重新生成并保存恢复密钥。",
+  "menu.encrypt": "加密所选内容",
+  "menu.decryptClipboard": "解密所选内容到剪贴板",
+  "menu.lockNote": "锁定这篇笔记",
+  "menu.decryptWhole": "解密整个文档（转为明文 .md）",
+  "status.clickLockAll": "点击状态栏可一键锁定全部",
+  "menu.unlock": "解锁",
+  "menu.decryptWholeTitle": "解密整个文档？",
+  "prompt.recovery": "输入主密码或恢复密钥",
+  "prompt.recoveryDesc": "用来验证重建出来的密钥库确实能解开你的笔记。验证通过后才会写入。",
+  "notice.alreadyEncrypted": "这篇笔记整体已经是加密的，内部无需再加密",
+  "notice.noSelectionDecrypt": "先选中要解密的内容",
+  "notice.decryptCopied": "已解密并复制",
+  "settings.notSet": "未设置",
+  "settings.modify": "修改",
+  "settings.newPassword": "设置新的主密码",
+  "settings.hintExample": "例：常用的那句诗",
+  "settings.strengthMedium": "强度：一般。",
+  "recovery.fingerprint": "密钥指纹：{fp}",
+  "recovery.fileTitle": "Sealed Note 恢复密钥",
+  "recovery.fileUse": "忘记主密码时用这串字符重设密码，笔记不会丢失。",
+  "recovery.fileWarn": "任何拿到它的人都能打开你的加密笔记，请离线保管。",
+  "picker.title": "选择一篇用来恢复的笔记",
+  "picker.desc": "这些笔记里都带着同一把数据密钥的密文副本。任选一篇即可恢复整个保管库——不是只恢复这一篇。列表按密钥代次从新到旧排列，建议选最上面那个。",
+  "picker.use": "用这篇",
+  "picker.verify": "验证并重建",
+  "prompt.enterContent": "请输入内容",
+  "totp.wrongCodeShort": "请输入 6 位数字",
+  "mode.bothDesc2": "两把钥匙缺一不可。安全性最高，换设备时主密码 + 恢复密钥仍可进入。",
+  "common.ok": "确定",
+  "common.min10": "至少 10 个字符",
+  "status.noneUnlocked2": "没有已解锁的笔记",
+  "status.clickLockAll2": "点击锁定全部",
+  "confirm.decryptBody2": "这会创建一份明文 .md 副本。明文会进入搜索索引、图谱和同步历史。\n\n原隐私笔记会保留，不会自动删除。",
+  "confirm.keyringBody2": "现有密钥库会被覆盖，并先备份到 backups/ 目录。\n\n只有在你确定当前密钥库无法解锁时才需要这样做。",
+  "confirm.recoveryBody2": "之前的恢复密钥会立刻失效，任何用它保存的备份都将无法重设密码。\n\n只有在你确认旧密钥已经泄露，或者从未保存过它时，才应该这样做。",
+  "settings.changePassword": "修改主密码",
+  "settings.totpHintA": "换电脑时：在你的验证器 App 里导出 otpauth:// 链接，下次解锁时粘贴即可。 ",
+  "settings.totpHintB": "忘记主密码时用恢复密钥重设；恢复密钥与验证器种子是两条独立的路。",
+  "settings.securityLong": "主密码不会保存在任何设备上，也不会被同步，因此无法被找回——任何声称能找回密码的工具都在骗你。忘记密码时，用恢复密钥重设主密码即可，笔记不会丢失。恢复密钥也丢了，数据就永久无法解密。",
+  "settings.offlineName": "导出离线解密工具",
+  "settings.offlineDesc2": "保存一份 decrypt.html，在没有 Obsidian 的机器上也能解密笔记。（v1.1 提供）",
+  "settings.info": "说明",
+  "settings.infoBody": "离线解密工具位于插件目录 tools/decrypt.html，可直接用浏览器打开。",
+  "common.lock": "锁定",
+  "common.min10Desc": "至少 10 个字符。改密码只会重新包装数据密钥，所有笔记无需重新加密。",
+  "setup.caution2": "主密码不会保存在任何设备上，也不会被同步。忘记密码时，只有恢复密钥能救你——没有任何工具能帮你找回密码。",
+  "totp.warningA": "种子只在你的验证器 App 里。插件不保存它、不写盘、也不放进笔记。",
+  "totp.warningB": "换电脑时，从验证器导出 otpauth 链接并在解锁框里粘贴即可。请把下面的链接离线备份。",
+  "seedImport.title": "恢复本机动态密码种子",
+  "seedImport.desc": "粘贴从验证器导出的 otpauth:// 链接。这会恢复【同一个种子】——你的手机和 6 位码都不用变。",
+  "seedImport.steps": "换了电脑、或清理了本机应用数据后用这个。不需要重新扫码，也不需要换种子。",
+  "seedImport.import": "导入",
+  "seedImport.invalid": "必须以 otpauth:// 开头",
+  "seedImport.ok": "本机种子已恢复。以后这台设备只输 6 位码即可解锁。",
+  "seedImport.rebindHint": "连手机上的种子也丢了？用恢复密钥解锁后，点「更改」绑定全新种子。",
+  "settings.importSeed": "恢复本机种子缓存",
+  "settings.importSeedDesc": "换了电脑、或本机应用数据被清理？粘贴验证器导出的 otpauth 链接即可恢复同一个种子，不用重新扫码。",
+
+};
+
+const dictionaries: Record<ResolvedLanguage, Record<string, string>> = { en, zh };
+
+let current: ResolvedLanguage = "en";
+let preference: Language = "auto";
+
+/** Resolve "auto" against Obsidian's UI language. */
+function detect(): ResolvedLanguage {
+  try {
+    const lang = getLanguage();
+    return lang && lang.toLowerCase().startsWith("zh") ? "zh" : "en";
+  } catch {
+    return "en";
+  }
+}
+
+export function setLanguage(value: Language): void {
+  preference = value;
+  current = value === "auto" ? detect() : value;
+}
+
+export function currentLanguage(): ResolvedLanguage {
+  return current;
+}
+
+export function configuredLanguage(): Language {
+  return preference;
+}
+
+/** Translate a key, substitute {vars}, and fall back without throwing. */
+export function t(key: string, vars?: Record<string, string | number>): string {
+  const dict = dictionaries[current];
+  let text: string = dict[key] ?? en[key] ?? key;
+  if (vars) {
+    for (const [name, value] of Object.entries(vars)) {
+      text = text.split(`{${name}}`).join(String(value));
+    }
+  }
+  return text;
+}
+
+/** All languages, for the settings dropdown. */
+export const LANGUAGE_OPTIONS: Record<Language, string> = {
+  auto: "auto",
+  en: "English",
+  zh: "简体中文",
+};

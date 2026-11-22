@@ -1,0 +1,10 @@
+node_modules/
+dist-tests/
+main.js
+*.log
+.DS_Store
+.data/
+.env
+.env.*
+backups/
+.workbuddy/

@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sealed Note — 离线解密工具</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #666;
+    --border: #d8d8d8;
+    --panel: #f6f6f6;
+    --accent: #3b6cf0;
+    --danger: #c62828;
+    --ok: #2e7d32;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181a;
+      --fg: #e8e8e8;
+      --muted: #9a9a9a;
+      --border: #33363a;
+      --panel: #212326;
+      --accent: #6b93ff;
+      --danger: #ff6b6b;
+      --ok: #66bb6a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0 auto;
+    max-width: 62rem;
+    padding: 1.5rem 1.25rem 4rem;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.55;
+  }
+  h1 { font-size: 1.35rem; margin: 0 0 0.35rem; }
+  h2 { font-size: 1rem; margin: 1.75rem 0 0.6rem; }
+  .sub { color: var(--muted); font-size: 0.9rem; margin: 0 0 1.25rem; }
+  .row { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center; margin-bottom: 0.7rem; }
+  label { font-size: 0.86rem; color: var(--muted); }
+  input[type="password"], input[type="text"] {
+    font: inherit; padding: 0.45rem 0.6rem;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--fg); min-width: 20rem; flex: 1;
+  }
+  textarea {
+    width: 100%; min-height: 11rem; font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: 0.85rem; padding: 0.6rem; border: 1px solid var(--border);
+    border-radius: 6px; background: var(--bg); color: var(--fg); resize: vertical;
+  }
+  button {
+    font: inherit; font-size: 0.88rem; padding: 0.42rem 0.85rem; cursor: pointer;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel); color: var(--fg);
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .note {
+    background: var(--panel); border-left: 3px solid var(--accent);
+    padding: 0.6rem 0.8rem; border-radius: 4px; font-size: 0.86rem;
+    color: var(--muted); margin: 0.75rem 0;
+  }
+  .warn { border-left-color: var(--danger); }
+  .summary { font-size: 0.85rem; color: var(--muted); margin-top: 0.5rem; white-space: pre-line; }
+  .err { color: var(--danger); }
+  .ok { color: var(--ok); }
+  details { margin-top: 1rem; font-size: 0.85rem; color: var(--muted); }
+  code { font-family: ui-monospace, Consolas, monospace; font-size: 0.85em; }
+</style>
+</head>
+<body>
+
+<h1>Sealed Note — 离线解密工具</h1>
+<p class="sub">不需要 Obsidian，不需要联网。这个文件不发送任何请求，也可以断网使用。</p>
+
+<div class="note warn">
+  <strong>用法：</strong>把 <code>.sealed</code> 文件或整篇笔记文本贴进下面的框里，输入主密码或恢复密钥，点解密。
+  这个页面在本地运行；请确认你是从自己的仓库拿到它的，不要使用别人发给你的副本。
+</div>
+
+<h2>1. 解锁凭据</h2>
+<div class="row">
+  <label for="secret">主密码或恢复密钥</label>
+  <input id="secret" type="password" placeholder="输入后不会离开这个页面" autocomplete="off" />
+  <button id="toggle" type="button">显示</button>
+</div>
+<div class="row">
+  <label for="source">另一篇 .sealed.md（可选；粘贴的笔记自带密钥时无需选）</label>
+  <input id="source" type="file" accept=".md,.json,.txt" />
+</div>
+
+<h2>2. 要解密的内容</h2>
+<textarea id="input" placeholder="粘贴 .sealed 文件全文，或含加密块的 Markdown 笔记"></textarea>
+<div class="row" style="margin-top:0.6rem">
+  <button id="run" class="primary" type="button">解密</button>
+  <button id="copy" type="button">复制结果</button>
+  <button id="clear" type="button">清空</button>
+</div>
+
+<h2>3. 结果</h2>
+<textarea id="output" readonly placeholder="解密后的内容会出现在这里"></textarea>
+<div id="summary" class="summary"></div>
+
+<details>
+  <summary>格式说明（可独立复现的实现细节）</summary>
+  <p>
+    <strong>密钥副本</strong>：每篇 <code>.sealed.md</code> 笔记的 <code>keys</code> 字段存一份被包裹的数据密钥（DEK），任选一篇即可：
+    <code>wrap.data = AES-256-GCM(PBKDF2(secret, salt, 600000, SHA-512), DEK)</code>，
+    AAD 为 <code>sealed-note|keyring|&lt;vaultId&gt;|&lt;slot&gt;|g&lt;gen&gt;</code>。
+    恢复密钥走 <code>recovery</code> slot，先做 Base32 规范化（大写、去除非 A-Z2-7 字符）。
+  </p>
+  <p>
+    <strong>笔记</strong>：<code>{"format":"sealed-note/note/1","kid","salt","iv","data"}</code>；
+    文件密钥 = <code>HKDF-SHA256(DEK, salt, "sealed-note/note/v1")</code>，
+    AAD 为 <code>sealed-note|note|&lt;vaultId&gt;</code>，密文与 16 字节 tag 拼接后 Base64。
+  </p>
+  <p>
+    <strong>内联块</strong>：payload 形如 <code>sn1.&lt;base64(salt8‖iv12‖ciphertext‖tag)&gt;</code>，
+    密钥 = <code>HKDF-SHA256(DEK, salt8, "sealed-note/inline/v1")</code>，
+    AAD 为 <code>sealed-note|inline|&lt;vaultId&gt;|v1</code>。
+  </p>
+</details>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ */
+/* primitives - mirrors src/core/crypto.ts exactly                     */
+/* ------------------------------------------------------------------ */
+
+const subtle = crypto.subtle;
+
+function fromBase64(b64) {
+  const clean = (b64 || "").replace(/\s+/g, "");
+  const bin = atob(clean);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function fromBase32(input) {
+  const B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const clean = (input || "").toUpperCase().replace(/[^A-Z2-7]/g, "");
+  const out = [];
+  let bits = 0, value = 0;
+  for (const ch of clean) {
+    const idx = B32.indexOf(ch);
+    if (idx < 0) throw new Error("恢复密钥含有非法字符");
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) { out.push((value >>> (bits - 8)) & 0xff); bits -= 8; }
+  }
+  return new Uint8Array(out);
+}
+
+async function deriveKey(secret, salt, iterations, hash) {
+  const material = await subtle.importKey("raw", new TextEncoder().encode(secret), "PBKDF2", false, ["deriveKey"]);
+  return subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations, hash },
+    material,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"]
+  );
+}
+
+async function hkdfKey(baseKey, salt, info) {
+  const material = await subtle.importKey("raw", baseKey, "HKDF", false, ["deriveKey"]);
+  return subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt, info: new TextEncoder().encode(info) },
+    material,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"]
+  );
+}
+
+/**
+ * Decrypt to raw bytes. Use this when the plaintext is a key, not text:
+ * decoding a 32 byte DEK as UTF-8 corrupts any byte that is not valid UTF-8
+ * (it becomes U+FFFD), which silently destroys the key.
+ */
+async function openBytes(key, iv, data, aad) {
+  const params = { name: "AES-GCM", iv, tagLength: 128 };
+  if (aad) params.additionalData = new TextEncoder().encode(aad);
+  const plain = await subtle.decrypt(params, key, data);
+  return new Uint8Array(plain);
+}
+
+/** Decrypt to text. Only for payloads that are genuinely UTF-8. */
+async function open_(key, iv, data, aad) {
+  const bytes = await openBytes(key, iv, data, aad);
+  return new TextDecoder().decode(bytes);
+}
+
+/* ------------------------------------------------------------------ */
+/* keyring                                                             */
+/* ------------------------------------------------------------------ */
+
+function normalizeSecretForSlot(slot, secret) {
+  if (slot === "recovery") {
+    const clean = (secret || "").toUpperCase().replace(/[^A-Z2-7]/g, "");
+    return "sn-rec|" + clean;
+  }
+  if (slot === "password") return "sn-pwd|" + secret;
+  if (slot === "totp") return "sn-totp|" + secret;
+  if (slot === "password-totp") return "sn-pwd-totp|" + secret;
+  return secret;
+}
+
+async function unwrapDekFromKeyring(keyring, secret) {
+  if (!keyring || !keyring.slots || !keyring.vaultId) {
+    throw new Error("这不是有效的密钥副本（请选择一篇 .sealed.md 笔记）");
+  }
+  const kdf = keyring.kdf || {};
+  const iterations = kdf.iterations;
+  const hash = kdf.hash || "SHA-512";
+  if (typeof iterations !== "number" || iterations < 100000) {
+    throw new Error("keyring 的迭代次数异常，可能已被篡改");
+  }
+
+  const slotOrder = ["password", "recovery"];
+  const errors = [];
+
+  for (const slot of slotOrder) {
+    const entry = keyring.slots && keyring.slots[slot];
+    if (!entry) continue;
+    try {
+      const kek = await deriveKey(
+        normalizeSecretForSlot(slot, secret),
+        fromBase64(entry.salt),
+        iterations,
+        hash
+      );
+      const aad = `sealed-note|keyring|${keyring.vaultId}|${slot}|g${entry.gen}`;
+      const dek = await openBytes(
+        kek,
+        fromBase64(entry.wrap.iv),
+        fromBase64(entry.wrap.data),
+        aad
+      );
+      if (dek.length !== 32) throw new Error("解出的密钥长度不对");
+      return dek;
+    } catch (e) {
+      errors.push(slot);
+    }
+  }
+  throw new Error("主密码和恢复密钥都无法解开这个密钥库");
+}
+
+/* ------------------------------------------------------------------ */
+/* note + inline                                                       */
+/* ------------------------------------------------------------------ */
+
+async function decryptNoteFile(dek, envelope, vaultId) {
+  const key = await hkdfKey(dek, fromBase64(envelope.salt), "sealed-note/note/v1");
+  return open_(
+    key,
+    fromBase64(envelope.iv),
+    fromBase64(envelope.data),
+    `sealed-note|note|${vaultId}`
+  );
+}
+
+const FENCE_RE = /^([ \t]*)```([A-Za-z0-9_]*)[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```/gm;
+
+async function decryptInlinePayload(dek, payload, vaultId) {
+  const clean = (payload || "").replace(/\s+/g, "");
+  const dot = clean.indexOf(".");
+  if (dot < 0) throw new Error("不是 sn1 载荷");
+  if (clean.slice(0, dot) !== "sn1") throw new Error("不支持的载荷版本");
+  const bytes = fromBase64(clean.slice(dot + 1));
+  if (bytes.length < 8 + 12 + 16) throw new Error("载荷长度不足");
+  const salt = bytes.slice(0, 8);
+  const iv = bytes.slice(8, 20);
+  const data = bytes.slice(20);
+  const key = await hkdfKey(dek, salt, "sealed-note/inline/v1");
+  return open_(key, iv, data, `sealed-note|inline|${vaultId}|v1`);
+}
+
+async function decryptDocument(dek, text, vaultId) {
+  let out = text;
+  let fencedOk = 0, fencedFail = 0;
+
+  // fences first, back to front
+  const blocks = [];
+  FENCE_RE.lastIndex = 0;
+  let m;
+  while ((m = FENCE_RE.exec(text)) !== null) {
+    if (!["encrypted_txt", "txt_encrypted", "sealed"].includes(m[2].toLowerCase())) continue;
+    blocks.push({ start: m.index, end: m.index + m[0].length, payload: m[3].trim() });
+  }
+  blocks.sort((a, b) => b.start - a.start);
+  for (const b of blocks) {
+    try {
+      const plain = await decryptInlinePayload(dek, b.payload, vaultId);
+      out = out.slice(0, b.start) + plain + out.slice(b.end);
+      fencedOk++;
+    } catch { fencedFail++; }
+  }
+
+  // then inline payloads
+  let inlineOk = 0, inlineFail = 0;
+  const re = /`(sn1\.[A-Za-z0-9+/=]+)`|(?<![A-Za-z0-9+/=])(sn1\.[A-Za-z0-9+/=]{40,})/g;
+  const hits = [];
+  let h;
+  while ((h = re.exec(out)) !== null) {
+    hits.push({ start: h.index, end: h.index + h[0].length, payload: (h[1] || h[2]).trim() });
+  }
+  hits.sort((a, b) => b.start - a.start);
+  for (const hit of hits) {
+    try {
+      const plain = await decryptInlinePayload(dek, hit.payload, vaultId);
+      out = out.slice(0, hit.start) + plain + out.slice(hit.end);
+      inlineOk++;
+    } catch { inlineFail++; }
+  }
+
+  return { out, fencedOk, fencedFail, inlineOk, inlineFail };
+}
+
+/* ------------------------------------------------------------------ */
+/* wiring                                                              */
+/* ------------------------------------------------------------------ */
+
+const $ = (id) => document.getElementById(id);
+const summary = $("summary");
+
+function say(text, kind) {
+  summary.className = "summary" + (kind ? " " + kind : "");
+  summary.textContent = text;
+}
+
+$("toggle").addEventListener("click", () => {
+  const input = $("secret");
+  const showing = input.type === "text";
+  input.type = showing ? "password" : "text";
+  $("toggle").textContent = showing ? "显示" : "隐藏";
+});
+
+$("clear").addEventListener("click", () => {
+  $("input").value = "";
+  $("output").value = "";
+  $("secret").value = "";
+  say("");
+});
+
+$("copy").addEventListener("click", async () => {
+  const text = $("output").value;
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    say("已复制到剪贴板。注意：剪贴板是共享的，用完请清空。", "ok");
+  } catch {
+    say("复制失败，请手动选中文本复制", "err");
+  }
+});
+
+$("run").addEventListener("click", async () => {
+  const secret = $("secret").value;
+  const text = $("input").value;
+  const fileInput = $("source").files && $("source").files[0];
+
+  $("output").value = "";
+  if (!secret) { say("请输入主密码或恢复密钥", "err"); return; }
+  if (!text.trim()) { say("请粘贴要解密的内容", "err"); return; }
+
+  $("run").disabled = true;
+  say("处理中…（PBKDF2 需要一点时间）");
+
+  try {
+    // Parse the pasted content. A whole note carries its own `keys` field, so
+    // in the common case no second file is needed at all.
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch { /* not json */ }
+
+    const pastedCopy = parsed && parsed.keys ? parsed.keys : null;
+
+    // Optional fallback: another encrypted note that carries the key.
+    let selectedCopy = null;
+    if (fileInput) {
+      const selected = JSON.parse(await fileInput.text());
+      selectedCopy = selected.keys || selected;
+    }
+
+    let dek = null;
+    let vaultId = null;
+    const copy = pastedCopy || selectedCopy;
+    if (copy && copy.slots) {
+      dek = await unwrapDekFromKeyring(copy, secret);
+      vaultId = copy.vaultId;
+    }
+
+    if (parsed && parsed.format === "sealed-note/note/1") {
+      if (!dek) {
+        say("这篇笔记没有密钥副本。请选择任意另一篇 .sealed.md 来取出密钥。", "err");
+        return;
+      }
+      const plain = await decryptNoteFile(dek, parsed, vaultId);
+      $("output").value = plain;
+      say(`已解密整篇笔记（${plain.length} 字符）。`, "ok");
+      return;
+    }
+
+    if (!dek) {
+      say("请选择一篇 .sealed.md 笔记来取出密钥（或粘贴带 keys 字段的完整笔记）", "err");
+      return;
+    }
+
+    const result = await decryptDocument(dek, text, vaultId);
+    $("output").value = result.out;
+    const lines = [
+      `加密块：成功 ${result.fencedOk}，失败 ${result.fencedFail}`,
+      `行内密文：成功 ${result.inlineOk}，失败 ${result.inlineFail}`,
+    ];
+    say(lines.join("\n"), result.fencedFail + result.inlineFail === 0 ? "ok" : "err");
+  } catch (error) {
+    say(String(error && error.message ? error.message : error), "err");
+  } finally {
+    $("run").disabled = false;
+  }
+});
+</script>
+</body>
+</html>

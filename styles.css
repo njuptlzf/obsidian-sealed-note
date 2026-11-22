@@ -1,0 +1,401 @@
+/* Sealed Note - styles
+   Uses Obsidian theme variables so it follows light/dark automatically. */
+
+.sealed-modal h2 {
+  margin-bottom: 0.75rem;
+}
+
+.sealed-warning {
+  background: var(--background-modifier-error-hover, rgba(255, 90, 90, 0.1));
+  border-left: 3px solid var(--text-error, #e5484d);
+  border-radius: var(--radius-s, 4px);
+  padding: 0.6rem 0.8rem;
+  margin: 0.5rem 0 1rem;
+  font-size: var(--font-ui-small, 13px);
+  line-height: 1.5;
+}
+
+.sealed-hint {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small, 13px);
+  line-height: 1.5;
+}
+
+.sealed-caution {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller, 12px);
+  margin-top: 0.9rem;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 0.6rem;
+}
+
+.sealed-error {
+  color: var(--text-error, #e5484d);
+  font-size: var(--font-ui-small, 13px);
+  min-height: 1.2em;
+  margin-top: 0.4rem;
+}
+
+.sealed-input {
+  width: 100%;
+}
+
+.sealed-field .setting-item-control {
+  width: 100%;
+}
+
+.sealed-field input[type="text"],
+.sealed-field input[type="password"] {
+  width: 100%;
+  font-family: var(--font-monospace);
+}
+
+.sealed-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.sealed-actions-wrap {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
+.sealed-tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin-bottom: 0.75rem;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.sealed-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 0.4rem 0.7rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.sealed-tab:hover {
+  color: var(--text-normal);
+}
+
+.sealed-tab.is-active {
+  color: var(--text-normal);
+  border-bottom-color: var(--interactive-accent);
+  font-weight: 600;
+}
+
+.sealed-key-box {
+  font-family: var(--font-monospace);
+  font-size: 1.02em;
+  letter-spacing: 0.06em;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s, 4px);
+  padding: 0.9rem;
+  margin: 0.6rem 0;
+  user-select: all;
+  word-break: break-all;
+  line-height: 1.7;
+}
+
+.sealed-uri {
+  display: block;
+  font-family: var(--font-monospace);
+  font-size: 0.82em;
+  background: var(--background-secondary);
+  padding: 0.5rem;
+  border-radius: var(--radius-s, 4px);
+  word-break: break-all;
+  margin: 0.4rem 0;
+}
+
+.sealed-ack {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  margin: 1rem 0;
+  font-size: var(--font-ui-small, 13px);
+  line-height: 1.45;
+}
+
+.sealed-ack input {
+  margin-top: 0.2rem;
+}
+
+.sealed-strength {
+  font-size: var(--font-ui-smaller, 12px);
+  color: var(--text-muted);
+  min-height: 1.1em;
+  margin: -0.5rem 0 0.5rem;
+}
+
+.sealed-strength.is-weak {
+  color: var(--text-error, #e5484d);
+}
+
+.sealed-status {
+  cursor: pointer;
+  font-size: var(--font-ui-smaller, 12px);
+}
+
+/* ---------------- sealed view ---------------- */
+
+.sealed-view {
+  padding: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.sealed-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.45rem 0.9rem;
+  background: var(--background-secondary);
+  border-bottom: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-smaller, 12px);
+}
+
+.sealed-toolbar-label {
+  color: var(--text-muted);
+}
+
+.sealed-btn {
+  font-size: var(--font-ui-smaller, 12px);
+  padding: 0.2rem 0.6rem;
+  box-shadow: none;
+}
+
+.sealed-editor {
+  flex: 1;
+  width: 100%;
+  border: none;
+  outline: none;
+  resize: none;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-family: var(--font-text, var(--font-monospace));
+  font-size: var(--font-text-size, 16px);
+  line-height: var(--line-height-normal, 1.6);
+  padding: 1.5rem max(1.5rem, 8vw);
+  min-height: 60vh;
+}
+
+.sealed-locked {
+  margin: auto;
+  text-align: center;
+  padding: 3rem 1.5rem;
+  max-width: 26rem;
+}
+
+.sealed-locked-icon {
+  font-size: 2.4rem;
+  margin-bottom: 0.5rem;
+}
+
+.sealed-locked h3 {
+  margin: 0 0 0.5rem;
+}
+
+/* ---------------- inline blocks ---------------- */
+
+.sealed-block {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m, 6px);
+  background: var(--background-secondary);
+  padding: 0.55rem 0.75rem;
+  margin: 0.6rem 0;
+  font-family: var(--font-monospace);
+  font-size: 0.9em;
+}
+
+.sealed-block-invalid {
+  border-color: var(--text-error, #e5484d);
+}
+
+.sealed-block-lock {
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.15rem 0;
+  font-family: var(--font-monospace);
+  font-size: 0.95em;
+}
+
+.sealed-block-lock:hover {
+  color: var(--interactive-accent);
+}
+
+.sealed-block.is-revealed {
+  background: var(--background-primary);
+  border-color: var(--interactive-accent);
+}
+
+.sealed-block-plain {
+  margin: 0.35rem 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-monospace);
+  color: var(--text-normal);
+  background: transparent;
+}
+
+.sealed-block-bar {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  margin-top: 0.4rem;
+}
+
+.sealed-pill {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.88em;
+  font-family: var(--font-monospace);
+  user-select: none;
+}
+
+.sealed-pill:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-active-hover);
+}
+
+.sealed-pill.is-revealed {
+  color: var(--text-normal);
+  background: var(--background-secondary);
+  border: 1px solid var(--interactive-accent);
+  border-radius: var(--radius-s, 4px);
+  user-select: text;
+  padding: 0.05rem 0.4rem;
+}
+
+/* ---------------- settings ---------------- */
+
+.sealed-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m, 6px);
+  padding: 0.5rem 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.sealed-card h3 {
+  margin-top: 0.75rem;
+}
+
+.sealed-seed summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small, 13px);
+  padding: 0.3rem 0;
+}
+
+.sealed-seed code {
+  display: block;
+  margin: 0.5rem 0;
+  user-select: all;
+}
+/* ---------------- recover from note ---------------- */
+
+.sealed-candidate-list {
+  max-height: 50vh;
+  overflow-y: auto;
+  margin: 1rem 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m, 6px);
+}
+
+.sealed-candidate {
+  padding: 0.6rem 0.9rem;
+  border-bottom: 1px solid var(--background-modifier-border);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.25rem 0.75rem;
+  align-items: center;
+}
+
+.sealed-candidate:last-child {
+  border-bottom: none;
+}
+
+.sealed-candidate-path {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small, 13px);
+  word-break: break-all;
+}
+
+.sealed-candidate .sealed-hint {
+  grid-column: 1;
+  margin: 0;
+}
+
+.sealed-candidate button {
+  grid-row: 1 / span 2;
+  grid-column: 2;
+  font-size: var(--font-ui-smaller, 12px);
+  box-shadow: none;
+}
+
+/* ---------------- TOTP QR ---------------- */
+
+.sealed-qr {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 220px;
+  margin: 0.75rem 0;
+  padding: 0.8rem;
+  background: #ffffff;
+  border-radius: var(--radius-m, 6px);
+  color: #000000;
+}
+
+.sealed-qr-img {
+  width: 220px;
+  height: 220px;
+  image-rendering: pixelated;
+}
+
+.sealed-mode-option {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m, 6px);
+  padding: 0.7rem 0.9rem;
+  margin-bottom: 0.6rem;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.2rem 0.75rem;
+  align-items: center;
+}
+
+.sealed-mode-title {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.sealed-mode-option .sealed-hint {
+  grid-column: 1;
+  margin: 0;
+}
+
+.sealed-mode-option button {
+  grid-row: 1 / span 2;
+  grid-column: 2;
+  font-size: var(--font-ui-smaller, 12px);
+  box-shadow: none;
+}
