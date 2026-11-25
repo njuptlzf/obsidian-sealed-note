@@ -18,10 +18,6 @@ export interface SealedNoteSettings {
   language: Language;
   /** extension of private notes */
   extension: string;
-  /** vault-relative folder for per-note encrypted payload files */
-  payloadDir: string;
-  /** delete the sidecar payload when its note is deleted */
-  deletePayloadWithNote: boolean;
   /** show a lock pill in reading view for inline payloads */
   showInlineBadges: boolean;
   /** when an unlocked note re-locks itself */
@@ -35,8 +31,6 @@ export interface SealedNoteSettings {
 export const DEFAULT_SETTINGS: SealedNoteSettings = {
   language: "auto" as Language,
   extension: "sealed.md",
-  payloadDir: "sealed-data",
-  deletePayloadWithNote: false,
   showInlineBadges: true,
   // Highest privacy by default: the moment focus leaves the note - another
   // window, another note, another tab, the settings page - it is encrypted and
@@ -54,12 +48,6 @@ export function normalizeSettings(raw: unknown): SealedNoteSettings {
   }
   if (typeof input.extension === "string" && /^[a-z0-9.]{2,20}$/i.test(input.extension)) {
     out.extension = input.extension.toLowerCase();
-  }
-  if (typeof input.payloadDir === "string" && /^[A-Za-z0-9_-]{1,60}$/.test(input.payloadDir)) {
-    out.payloadDir = input.payloadDir;
-  }
-  if (typeof input.deletePayloadWithNote === "boolean") {
-    out.deletePayloadWithNote = input.deletePayloadWithNote;
   }
   if (typeof input.showInlineBadges === "boolean") out.showInlineBadges = input.showInlineBadges;
   if (input.lockPolicy === "blur" || input.lockPolicy === "close" || input.lockPolicy === "session") {

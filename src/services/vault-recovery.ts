@@ -11,7 +11,7 @@
  */
 
 import { App, TFile, normalizePath } from "obsidian";
-import { KeyCopy, NoteEnvelope, parseNoteRef } from "../core/format";
+import { KeyCopy, NoteEnvelope, noteBodyState } from "../core/format";
 import {
   KeyringData,
   formatKeyringFromCopy,
@@ -56,8 +56,8 @@ export class VaultRecoveryService {
       if (!this.notes.isKeySourcePath(file.path)) continue;
       try {
         if (this.notes.isSealedPath(file.path)) {
-          const noteRaw = await this.app.vault.read(file);
-          if (parseNoteRef(noteRaw)) continue;
+          const noteRaw = await this.app.vault.read(file).catch(() => "");
+          if (noteBodyState(noteRaw) !== "sealed") continue;
         }
         const envelope = await this.notes.tryReadEnvelope(file);
         if (!envelope?.keys) continue;

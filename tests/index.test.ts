@@ -58,10 +58,13 @@ import {
   findInlinePayloads,
   findUnsealedBlocks,
   openInline,
+  noteBodyState,
   openNote,
   parseNoteEnvelope,
   sealInline,
   sealNote,
+  serializeNoteEnvelope,
+  serializeNotePlain,
   wrapFenced,
 } from "../src/core/format";
 import { generateRecoveryKey, recoverySecret, assertRecoveryKey, groupRecovery } from "../src/core/recovery";
@@ -378,6 +381,27 @@ test("inline: scanner finds fenced blocks and payloads with exact offsets", asyn
   const inline = findInlinePayloads(src);
   assert.equal(inline.length, 1);
   assert.equal(inline[0].payload, "sn1.BBBB");
+});
+
+/* v2 single-file body states: the locked body IS the envelope, the unlocked
+ * body is bare plaintext, and old sidecar placeholders are recognised so the
+ * migration can still read them. */
+test("v2 note body: envelope / plaintext / legacy ref / empty classified", async () => {
+  const dek = new Uint8Array(32).fill(7);
+  const sealed = parseNoteEnvelope(await sealNote(dek, "vault-a", "kid", "# secret\nbody"));
+  assert.ok(sealed);
+  const envelopeText = serializeNoteEnvelope(sealed!);
+
+  assert.equal(noteBodyState(envelopeText), "sealed", "envelope body is locked");
+  assert.equal(noteBodyState(serializeNotePlain("# secret\nbody")), "revealed", "bare text is unlocked");
+  assert.equal(
+    noteBodyState("<!-- sealed-note:ref=12345678-abcd-1234-abcd-123456789012 -->\n<!-- hint -->\n"),
+    "sidecar-ref",
+    "old placeholder recognised for migration",
+  );
+  assert.equal(noteBodyState("  \n"), "empty");
+  // Round trip through the exact same envelope parser the note store uses.
+  assert.equal(await openNote(dek, "vault-a", parseNoteEnvelope(envelopeText)!), "# secret\nbody");
 });
 
 test("inline: wrapFenced produces something the scanner reads back", () => {

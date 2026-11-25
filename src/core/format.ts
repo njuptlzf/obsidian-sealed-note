@@ -391,6 +391,38 @@ export function findUnsealedBlocks(source: string): FencedBlock[] {
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* Single-file note body states (v2)                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * What a `.sealed.md` file body currently holds.
+ *
+ *   sealed      - the body IS the encrypted envelope (locked, v2 native)
+ *   revealed    - the body is plaintext (unlocked; no annotation at all)
+ *   sidecar-ref - old v1 placeholder pointing at sealed-data (read-only,
+ *                 migration target)
+ *   empty       - blank body, treated like `revealed` for an unlocked note
+ *
+ * Order matters: an envelope is recognised before a ref, because a legacy
+ * note's envelope can itself contain the word "sealed-note:ref" in its
+ * ciphertext-free JSON wrapper only if it is genuinely an envelope.
+ */
+export type NoteBodyState = "sealed" | "revealed" | "sidecar-ref" | "empty";
+
+export function noteBodyState(text: string): NoteBodyState {
+  const raw = (text ?? "").trim();
+  if (!raw) return "empty";
+  if (parseNoteEnvelope(text)) return "sealed";
+  if (parseNoteRef(text)) return "sidecar-ref";
+  return "revealed";
+}
+
+/** Plaintext for a v2 unlocked note is the whole body, byte for byte. */
+export function serializeNotePlain(plaintext: string): string {
+  return plaintext ?? "";
+}
+
 /** `sn1:...` or `` `sn1:...` `` inline payloads. */
 export function findInlinePayloads(source: string): Array<{ start: number; end: number; payload: string }> {
   const out: Array<{ start: number; end: number; payload: string }> = [];

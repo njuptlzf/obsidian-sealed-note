@@ -15,6 +15,13 @@ export interface SessionEntry {
   dek: Uint8Array;
   filePath: string;
   providerId: string;
+  /**
+   * Key copy captured at unlock time. In the single-file layout an unlocked
+   * note's body is plaintext, so the vault key copy is no longer on disk while
+   * the note is open. Locking this very note must still be able to write the
+   * `keys` field back, hence the in-memory copy for the session's lifetime.
+   */
+  keyring?: import("./keyring").KeyringData;
 }
 
 export class SessionStore {
@@ -26,8 +33,13 @@ export class SessionStore {
    * measure, so storing a borrowed reference would silently zero the caller's
    * key material.
    */
-  put(filePath: string, dek: Uint8Array, providerId: string): void {
-    this.entries.set(filePath, { dek: dek.slice(0), filePath, providerId });
+  put(
+    filePath: string,
+    dek: Uint8Array,
+    providerId: string,
+    keyring?: import("./keyring").KeyringData,
+  ): void {
+    this.entries.set(filePath, { dek: dek.slice(0), filePath, providerId, keyring });
   }
 
   get(filePath: string): SessionEntry | null {

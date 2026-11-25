@@ -217,129 +217,100 @@ test("commands that need a keyring fail with a typed, readable error", async () 
   plugin.onunload();
 });
 
-test("sealed note store writes only ciphertext and round trips", async () => {
+test("v2: locked note body is the envelope; round trip, no sidecar, no annotation", async () => {
   const { plugin, harness } = await boot();
   const { newDek } = await import("../src/core/keyring");
+  const { noteBodyState, parseNoteEnvelope } = await import("../src/core/format");
 
   const dek = newDek();
   const vaultId = "11111111-2222-4333-8444-555555555555";
   plugin.vaultIdentifier = vaultId;
 
-  const notes = plugin.notes;
   const file: any = { path: "Private/t.sealed.md", basename: "t", extension: "md" };
   harness.files.set(file.path, "");
-
   const body = "# 秘密标题\n\npassword = hunter2\n";
-  await notes.writePlaintext(file, dek, vaultId, vaultId, body);
+  await plugin.notes.writePlaintext(file, dek, vaultId, vaultId, body);
 
   const noteText = harness.files.get(file.path)!;
-  assert.ok(noteText.includes("sealed-note:ref="), "note keeps only an opaque ID");
-  assert.ok(!noteText.includes("sealed-note/note/1"), "no envelope in the note source");
+  assert.equal(noteBodyState(noteText), "sealed", "body is a locked envelope");
+  assert.ok(parseNoteEnvelope(noteText), "envelope is readable from the note itself");
   assert.ok(!noteText.includes("hunter2"), "no plaintext in the note");
-  const payloadPath = [...harness.files.keys()].find((p) => p.endsWith(".sealedpayload"))!;
-  const payload = harness.files.get(payloadPath)!;
-  assert.ok(payload.includes("sealed-note/note/1"), "envelope lives in the payload");
-  assert.ok(!payload.includes("hunter2"), "no plaintext on disk");
-  assert.ok(!payload.includes("秘密"), "no plaintext on disk (unicode)");
-  assert.ok(!harness.files.has(file.path + ".tmp"), "temp file cleaned up");
+  assert.ok(!noteText.includes("秘密"), "no plaintext (unicode) in the note");
+  assert.ok(!noteText.includes("sealed-note:ref"), "no annotation to maintain");
+  assert.ok(
+    ![...harness.files.keys()].some((p: string) => p.endsWith(".sealedpayload")),
+    "no sidecar payload was created",
+  );
+  assert.ok(!harness.files.has(file.path + ".tmp"), "no scratch file left behind");
 
-  assert.equal(await notes.readPlaintext(file, dek, vaultId), body, "round trip");
-
-  // and a different key must not open it
-  await assert.rejects(() => notes.readPlaintext(file, newDek(), vaultId));
-
+  assert.equal(await plugin.notes.readPlaintext(file, dek, vaultId), body, "round trip");
+  await assert.rejects(() => plugin.notes.readPlaintext(file, newDek(), vaultId), "wrong key fails");
   plugin.onunload();
 });
 
-test("sidecar format: note holds only a placeholder and an ID, renames cannot break it", async () => {
+test("v2: renaming/moving a locked note cannot separate it from its ciphertext", async () => {
   const { plugin, harness } = await boot();
   const { createKeyring } = await import("../src/core/keyring");
   const { generateRecoveryKey } = await import("../src/core/recovery");
-  const { parseNoteRef } = await import("../src/core/format");
 
   const vaultId = "10000000-2222-4333-8444-555555555555";
-  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), {
-    iterations: 100_000,
-  });
+  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), { iterations: 100_000 });
   plugin.vaultIdentifier = vaultId;
 
-  const file = await plugin.notes.create(
-    { vaultId, kid: vaultId, keyring },
-    dek,
-    "Private/new",
-    "新笔记",
-    "PLACEHOLDER",
-  );
+  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/new", "new note");
   const noteText = harness.files.get(file.path)!;
-  // Both lines are HTML comments: rendered view is a clean blank page.
-  assert.ok(noteText.trimStart().startsWith("<!--"), "placeholder is a comment, invisible when rendered");
-  assert.ok(noteText.includes("PLACEHOLDER"), "hint lives inside a comment");
-  assert.ok(!noteText.includes("keys"), "no key copy in note source");
-  assert.ok(!noteText.includes("sealed-note/note/1"), "no envelope in note source");
-  const ref = parseNoteRef(noteText);
-  assert.ok(ref, "a stable ID is present");
-  assert.ok(harness.files.has(`sealed-data/${ref}.sealedpayload`), "payload created in the configured folder");
+  assert.ok(noteText.trimStart().startsWith("<!--"), "envelope body is an HTML comment, invisible when rendered");
+  assert.ok(!noteText.includes("sealed-note:ref"), "no annotation in the body");
 
-  // Renaming the note is just a path change: the ID in its body is untouched.
+  // A path-only move (sync tool, manual rename) carries the ciphertext with it.
   const movedPath = "Renamed/moved.sealed.md";
   harness.files.set(movedPath, noteText);
   harness.files.delete(file.path);
   const moved: any = { path: movedPath, basename: "moved", extension: "md" };
-  assert.equal(
-    await plugin.notes.readPlaintext(moved, dek, vaultId),
-    "",
-    "payload still found after the note moved",
-  );
+  assert.equal(await plugin.notes.readPlaintext(moved, dek, vaultId), "", "ciphertext travels with the file");
   plugin.onunload();
 });
 
-test("migration moves a legacy envelope into a payload without changing content", async () => {
+test("v2: migration moves a v1 sidecar envelope into the note body, idempotently", async () => {
   const { plugin, harness } = await boot();
   const { createKeyring, keyCopyFromKeyringData } = await import("../src/core/keyring");
   const { generateRecoveryKey } = await import("../src/core/recovery");
-  const { sealNote } = await import("../src/core/format");
+  const { noteBodyState, noteRefLine, serializeNotePayload } = await import("../src/core/format");
 
   const vaultId = "20000000-2222-4333-8444-555555555555";
-  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), {
-    iterations: 100_000,
-  });
+  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), { iterations: 100_000 });
   plugin.vaultIdentifier = vaultId;
   const file: any = { path: "Private/old.sealed.md", basename: "old", extension: "md" };
-  harness.files.set(
-    file.path,
-    await sealNote(dek, vaultId, vaultId, "旧内容", keyCopyFromKeyringData(keyring)),
-  );
-  assert.equal(await plugin.notes.readPlaintext(file, dek, vaultId), "旧内容");
+  const env = (await import("../src/core/format")).parseNoteEnvelope(
+    await (await import("../src/core/format")).sealNote(dek, vaultId, vaultId, "旧内容", keyCopyFromKeyringData(keyring)),
+  )!;
+  const ref = "12345678-abcd-1234-abcd-123456789012";
+  harness.files.set(file.path, noteRefLine(ref) + "\n<!-- hint -->\n");
+  harness.files.set(`sealed-data/${ref}.sealedpayload`, serializeNotePayload(env));
 
-  await plugin.migrateToPayloads();
-
+  await plugin.migrateToSingleFile();
   const noteText = harness.files.get(file.path)!;
-  assert.ok(noteText.includes("sealed-note:ref="), "note became a placeholder");
-  assert.ok(!noteText.includes("sealed-note/note/1"), "envelope removed from note");
+  assert.equal(noteBodyState(noteText), "sealed", "note body is now the envelope");
+  assert.ok(!noteText.includes("sealed-note:ref"), "annotation removed");
+  assert.equal(harness.files.has(`sealed-data/${ref}.sealedpayload`), false, "old payload deleted");
   assert.equal(await plugin.notes.readPlaintext(file, dek, vaultId), "旧内容", "content intact");
-  assert.ok(
-    [...harness.files.keys()].some((p) => p.endsWith(".sealedpayload")),
-    "payload created",
-  );
+
+  // Re-running is a no-op.
+  await plugin.migrateToSingleFile();
+  assert.equal(await plugin.notes.readPlaintext(file, dek, vaultId), "旧内容", "idempotent");
   plugin.onunload();
 });
 
-test("deleting a note removes its payload when the setting is on", async () => {
+test("v2: deleting a note deletes its ciphertext with it (single file)", async () => {
   const { plugin, harness } = await boot();
   const { createKeyring } = await import("../src/core/keyring");
   const { generateRecoveryKey } = await import("../src/core/recovery");
-  const { parseNoteRef } = await import("../src/core/format");
 
   const vaultId = "30000000-2222-4333-8444-555555555555";
-  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), {
-    iterations: 100_000,
-  });
+  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), { iterations: 100_000 });
   plugin.vaultIdentifier = vaultId;
-  plugin.settingsData.deletePayloadWithNote = true; // explicit: default is now off
-  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/del", "删除");
-  const ref = parseNoteRef(harness.files.get(file.path)!)!;
-  const payloadPath = `sealed-data/${ref}.sealedpayload`;
-  assert.ok(harness.files.has(payloadPath), "payload exists before delete");
+  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/del", "delete me");
+  assert.ok(harness.files.has(file.path), "note exists before delete");
 
   const hook = harness.registered.events.find((e) => e.name === "vault:delete");
   assert.ok(hook, "delete hook registered");
@@ -347,32 +318,25 @@ test("deleting a note removes its payload when the setting is on", async () => {
   await hook!.fn({ path: file.path });
   await new Promise((resolve) => setTimeout(resolve, 0));
 
-  assert.equal(harness.files.has(payloadPath), false, "payload deleted with the note");
+  assert.equal(harness.files.has(file.path), false, "note and its ciphertext are gone together");
   plugin.onunload();
 });
 
-test("orphan payload detection ignores payloads referenced by notes", async () => {
+test("v2: a note whose sidecar is missing fails migration honestly, leaving the note intact", async () => {
   const { plugin, harness } = await boot();
   const { createKeyring } = await import("../src/core/keyring");
   const { generateRecoveryKey } = await import("../src/core/recovery");
-  const { parseNoteRef } = await import("../src/core/format");
+  const { noteRefLine } = await import("../src/core/format");
 
   const vaultId = "40000000-2222-4333-8444-555555555555";
-  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), {
-    iterations: 100_000,
-  });
+  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), { iterations: 100_000 });
   plugin.vaultIdentifier = vaultId;
-  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/keep", "保留");
-  const ref = parseNoteRef(harness.files.get(file.path)!)!;
-  harness.files.set("sealed-data/orphan-1234.sealedpayload", "{}\n");
+  await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/keep", "keep");
+  const oldPath = "Private/v1.sealed.md";
+  harness.files.set(oldPath, noteRefLine("12345678-abcd-1234-abcd-123456789012") + "\n<!-- hint -->\n");
 
-  const orphans = await plugin.notes.orphanPayloads();
-  assert.deepEqual(
-    orphans.map((f: any) => f.path),
-    ["sealed-data/orphan-1234.sealedpayload"],
-    "only the unreferenced payload is reported",
-  );
-  assert.ok(!orphans.some((f: any) => f.path.includes(ref)), "live payload is kept");
+  await plugin.migrateToSingleFile();
+  assert.equal(harness.files.get(oldPath), noteRefLine("12345678-abcd-1234-abcd-123456789012") + "\n<!-- hint -->\n", "unmigratable note left byte-for-byte intact for retry");
   plugin.onunload();
 });
 
@@ -478,67 +442,66 @@ test("onunload with a plain-note cache neither seals it nor throws", async () =>
   assert.equal(countPayloads(harness), payloadsBefore, "no orphan payload minted");
 });
 
-test("unlocking reveals plaintext in the note body and switches to the Markdown view", async () => {
+test("unlocking reveals bare plaintext in the note body and switches to Markdown", async () => {
   const { plugin, harness } = await boot();
   const { createKeyring } = await import("../src/core/keyring");
   const { generateRecoveryKey } = await import("../src/core/recovery");
-  const { parseNoteRef } = await import("../src/core/format");
+  const { noteBodyState } = await import("../src/core/format");
 
   const vaultId = "50000000-2222-4333-8444-555555555555";
-  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), {
-    iterations: 100_000,
-  });
+  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), { iterations: 100_000 });
   plugin.vaultIdentifier = vaultId;
-  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/native", "原生");
-  // Seed a payload with real content so reveal has something to show.
+  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/native", "native");
   await plugin.notes.writePlaintext(file, dek, vaultId, vaultId, "# 秘密\n", keyring);
   plugin.unlockService.dekFor = async () => dek;
   harness.registered.viewSwitches.length = 0;
 
   await plugin.unlockNote(file);
 
-  const ref = parseNoteRef(harness.files.get(file.path)!)!;
-  assert.ok(ref, "ref line survives reveal");
-  assert.ok(harness.files.get(file.path)!.includes("# 秘密"), "plaintext revealed IN the note body");
+  const body = harness.files.get(file.path)!;
+  assert.equal(body, "# 秘密\n", "body is bare plaintext, no annotation at all");
+  assert.equal(noteBodyState(body), "revealed", "body classified as unlocked");
   assert.ok(
     harness.registered.viewSwitches.some((s: any) => s.type === "markdown" && s.state?.file === file.path),
     "note switched to the native Markdown editor",
   );
   assert.equal(plugin.isUnlocked(file.path), true, "note tracked as unlocked");
-
   plugin.onunload();
 });
 
-test("editing the revealed body encrypts back to payload and locking restores the placeholder", async () => {
+test("v2: the same body flips from plaintext to envelope on lock, with no sidecar", async () => {
   const { plugin, harness } = await boot();
   const { createKeyring } = await import("../src/core/keyring");
   const { generateRecoveryKey } = await import("../src/core/recovery");
+  const { noteBodyState } = await import("../src/core/format");
 
   const vaultId = "60000000-2222-4333-8444-555555555555";
-  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), {
-    iterations: 100_000,
-  });
+  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), { iterations: 100_000 });
+  await plugin.keyringStore.save(keyring);
   plugin.vaultIdentifier = vaultId;
-  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/edit", "编辑");
+  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/edit", "edit");
   plugin.sessions.put(file.path, dek, "test");
   await plugin.unlockNote(file);
 
-  // Simulate the user editing: write plaintext into the note body, then flush.
-  const refLine = harness.files.get(file.path)!.split("\n")[0];
-  harness.files.set(file.path, `${refLine}\n# 改过的标题\n\n正文 secret-xyz\n`);
-  await plugin.flushNote(file.path);
-  assert.equal(
-    await plugin.notes.readPlaintext(file, dek, vaultId),
-    "# 改过的标题\n\n正文 secret-xyz\n",
-    "edited plaintext encrypted back into the payload",
-  );
+  // The user edits the body directly; there is no ref line to preserve.
+  harness.files.set(file.path, "# 改过的标题\n\n正文 secret-xyz\n");
+  assert.equal(noteBodyState(harness.files.get(file.path)!), "revealed");
 
   await plugin.lockNote(file.path);
   const lockedBody = harness.files.get(file.path)!;
-  assert.ok(!lockedBody.includes("secret-xyz"), "plaintext gone from the note body after lock");
-  assert.ok(lockedBody.trimStart().startsWith("<!--"), "placeholder comments restored");
+  assert.equal(noteBodyState(lockedBody), "sealed", "same file now holds the envelope");
+  assert.ok(!lockedBody.includes("secret-xyz"), "plaintext gone after lock");
+  assert.ok(!lockedBody.includes("sealed-note:ref"), "no annotation was ever needed");
   assert.equal(plugin.isUnlocked(file.path), false, "session dropped on lock");
-
+  assert.equal(
+    await plugin.notes.readPlaintext(file, dek, vaultId),
+    "# 改过的标题\n\n正文 secret-xyz\n",
+    "edited text survived the lock",
+  );
+  assert.ok(
+    ![...harness.files.keys()].some((p: string) => p.endsWith(".sealedpayload")),
+    "no sidecar was used at any point",
+  );
   plugin.onunload();
 });
 
@@ -607,11 +570,8 @@ test("first-run new note with no active file does not throw", async () => {
 
   const created = [...harness.files.keys()].find((p) => p.endsWith(".sealed.md"));
   assert.ok(created, "a sealed note was created");
-  assert.equal(await plugin.notes.readPlaintext(
-    { path: created!, basename: "x", extension: "md" } as any,
-    dek,
-    vaultId,
-  ), "", "note opens clean");
+  // A just-created note is revealed immediately, so its body is bare plaintext.
+  assert.equal(harness.files.get(created!), "", "note opens clean with an empty body");
   plugin.onunload();
 });
 
@@ -685,12 +645,11 @@ test("unlocking an already-revealed note is idempotent and still opens the edito
   plugin.onunload();
 });
 
-test("recovery key can enumerate payloads and restore a deleted annotation", async () => {
+test("v2: recovery key rebuilds the keyring from a locked note body, no annotation needed", async () => {
   const { plugin, harness } = await boot();
   const { createKeyring } = await import("../src/core/keyring");
   const { generateRecoveryKey } = await import("../src/core/recovery");
-  const { parseNoteRef } = await import("../src/core/format");
-  const { RestoreService } = await import("../src/services/restore-service");
+  const { noteBodyState, parseNoteEnvelope } = await import("../src/core/format");
 
   const vaultId = "b2000000-2222-4333-8444-555555555555";
   const recovery = generateRecoveryKey();
@@ -699,41 +658,28 @@ test("recovery key can enumerate payloads and restore a deleted annotation", asy
   });
   plugin.vaultIdentifier = vaultId;
 
-  const original = await plugin.notes.create(
-    { vaultId, kid: vaultId, keyring },
-    dek,
-    "Private/restore-me",
-    "恢复测试",
-    "PLACEHOLDER",
-  );
-  // Give the note real content so the candidate has a title/preview.
+  const original = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/restore-me", "recovery test");
   await plugin.notes.writePlaintext(original, dek, vaultId, vaultId, "# 我的秘密日记\n\n今天写点东西", keyring);
-  const oldRef = parseNoteRef(harness.files.get(original.path)!)!;
 
-  const service = new RestoreService(plugin.app, plugin.notes);
-  const { candidates, skipped } = await service.collectCandidates(recovery);
-  assert.ok(candidates.length >= 1, "recovery key opens at least one payload");
-  assert.equal(skipped, 0, "no payload skipped with the correct key");
-  const mine = candidates.find((c) => c.ref === oldRef);
-  assert.ok(mine, "the note's payload is among the candidates");
-  assert.equal(mine!.title, "我的秘密日记", "candidate title comes from decrypted text");
+  // Locked body is the envelope itself: no sidecar, no annotation, no keyring file.
+  const body = harness.files.get(original.path)!;
+  assert.equal(noteBodyState(body), "sealed", "locked note body is the envelope");
+  assert.ok(parseNoteEnvelope(body)?.keys, "key copy travels inside the note body");
+  assert.ok(
+    ![...harness.files.keys()].some((p: string) => p.endsWith(".sealedpayload")),
+    "no sidecar payload exists",
+  );
+  assert.ok(!body.includes("sealed-note:ref"), "no annotation to maintain");
 
-  // Wrong key opens nothing.
-  const wrong = await service.collectCandidates(generateRecoveryKey());
-  assert.equal(wrong.candidates.length, 0, "wrong recovery key opens nothing");
-
-  // Simulate deleting the annotation, then restore from the chosen candidate.
-  harness.files.set(original.path, "# 恢复测试\n\n注解被误删了\n");
-  const result = await service.restore(original, mine!);
-  assert.notEqual(result.newRef, oldRef, "a fresh ref is generated");
-  const newBody = harness.files.get(original.path)!;
-  assert.equal(parseNoteRef(newBody), result.newRef, "new annotation points at the new ref");
-  assert.ok(harness.files.has(`sealed-data/${result.newRef}.sealedpayload`), "new payload written");
-  assert.ok(harness.files.has(`sealed-data/${oldRef}.sealedpayload`), "old payload kept");
+  // The recovery service finds candidates from note bodies, not payload files.
+  const candidates = await plugin.recovery.findCandidates();
+  assert.ok(candidates.length >= 1, "locked notes are recovery candidates");
+  const wrong = await plugin.keyringStore.load();
+  assert.ok(wrong, "keyring loads from the note body alone");
   assert.equal(
     await plugin.notes.readPlaintext(original, dek, vaultId),
     "# 我的秘密日记\n\n今天写点东西",
-    "restored note decrypts back to the original text",
+    "note still decrypts after restart with no sidecar",
   );
   plugin.onunload();
 });
@@ -797,8 +743,9 @@ test("key copy: every note carries a wrapped vault key", async () => {
   await plugin.notes.writePlaintext(file, dek, vaultId, vaultId, "secret body", keyring);
 
   const noteText = harness.files.get(file.path)!;
-  assert.ok(noteText.includes("sealed-note:ref="), "note has only a ref");
-  assert.ok(!noteText.includes("\"keys\""), "no keys in the note source");
+  assert.ok(noteText.includes("sealed-note/note/1"), "the note body IS the envelope");
+  assert.ok(noteText.includes("\"keys\""), "key copy travels inside the note body");
+  assert.ok(!noteText.includes("sealed-note:ref"), "no annotation to maintain");
   const parsed = (await envelopeOf(plugin, file))!;
   assert.ok(parsed.keys, "key copy embedded");
   assert.equal(parsed.keys.vaultId, vaultId);
@@ -1527,40 +1474,24 @@ test("a plain note with an inline encrypted block is never locked", async () => 
   plugin.onunload();
 });
 
-test("by default deleting a note keeps its ciphertext; clean-orphans removes it", async () => {
+test("v2: sidecar settings and clean-orphans command are gone", async () => {
   const { plugin, harness } = await boot();
-  const { createKeyring } = await import("../src/core/keyring");
-  const { generateRecoveryKey } = await import("../src/core/recovery");
-  const { parseNoteRef } = await import("../src/core/format");
-
-  assert.equal(plugin.settingsData.deletePayloadWithNote, false, "payload retention is the default");
-  const vaultId = "e3000000-2222-4333-8444-555555555555";
-  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), {
-    iterations: 100_000,
-  });
-  plugin.vaultIdentifier = vaultId;
-  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/keep", "保留");
-  const ref = parseNoteRef(harness.files.get(file.path)!)!;
-  const payloadPath = `sealed-data/${ref}.sealedpayload`;
-
-  const hook = harness.registered.events.find((e) => e.name === "vault:delete");
-  assert.ok(hook, "delete hook registered");
-  harness.files.delete(file.path);
-  await hook!.fn({ path: file.path });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.ok(harness.files.has(payloadPath), "payload kept when the note is deleted by default");
-
-  const orphans = await plugin.notes.orphanPayloads();
-  assert.ok(orphans.some((f: any) => f.path === payloadPath), "kept payload is detected as orphan");
-
-  // A manual clean command and settings button both exist for clearing orphans.
-  const cmd = harness.registered.commands.find((c: any) => c.id === "clean-orphan-payloads");
-  assert.ok(cmd, "clean orphan command registered");
-  const settingsWithClean = (plugin as any).appSettingTab; // may be null in stub
-  void settingsWithClean;
-  // Removing one orphan directly (what the clean command does after confirm).
-  await plugin.notes.deletePayload(ref);
-  assert.equal(harness.files.has(payloadPath), false, "orphan payload can be removed");
+  assert.equal("payloadDir" in plugin.settingsData, false, "no payloadDir setting");
+  assert.equal("deletePayloadWithNote" in plugin.settingsData, false, "no payload retention setting");
+  assert.equal(
+    harness.registered.commands.some((c: any) => c.id === "clean-orphan-payloads"),
+    false,
+    "orphan-clean command removed",
+  );
+  assert.equal(
+    harness.registered.commands.some((c: any) => c.id === "restore-annotation"),
+    false,
+    "annotation-restore command removed",
+  );
+  assert.ok(
+    harness.registered.commands.some((c: any) => c.id === "migrate-to-single-file"),
+    "single-file migration command registered",
+  );
   plugin.onunload();
 });
 
@@ -1605,10 +1536,10 @@ test("legacy working copies are removed and revealed notes are recovered on load
   harness.files.set("sealed-note-work/stale-a.md", "plaintext");
   harness.files.set("sealed-note-work/stale-b.md", "");
 
-  // 2. A note left revealed on disk (crash while unlocked).
+  // 2. A note left revealed on disk (crash while unlocked): bare plaintext,
+  //    no annotation in the single-file layout.
   const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/crash", "崩溃");
-  const ref = harness.files.get(file.path)!.split("\n")[0];
-  harness.files.set(file.path, `${ref}\n# 未保存的明文 secret-xyz`);
+  harness.files.set(file.path, "# 未保存的明文 secret-xyz");
 
   await (plugin as any).recoverAfterCrash();
   assert.equal(harness.files.has("sealed-note-work/stale-a.md"), false, "stale copy a deleted");
@@ -1621,14 +1552,15 @@ test("legacy working copies are removed and revealed notes are recovered on load
     "the user is told about the leftover plaintext",
   );
 
-  // Locking re-seals with the real DEK.
-  plugin.sessions.put(file.path, dek, "test");
+  // Locking re-seals the very same file with the real DEK.
+  plugin.sessions.put(file.path, dek, "test", keyring);
   await plugin.lockNote(file.path);
-  assert.ok(!harness.files.get(file.path)!.includes("secret-xyz"), "plaintext re-sealed");
+  const locked = harness.files.get(file.path)!;
+  assert.ok(!locked.includes("secret-xyz"), "plaintext re-sealed into the body");
   assert.equal(
     await plugin.notes.readPlaintext({ path: file.path } as any, dek, vaultId),
     "# 未保存的明文 secret-xyz",
-    "content preserved in the payload",
+    "typed content preserved in the envelope",
   );
   plugin.onunload();
 });
@@ -1675,16 +1607,14 @@ test("creating a note asks for the credential before the file exists", async () 
   plugin.onunload();
 });
 
-test("a created note is encrypted with the real DEK from the first byte", async () => {
+test("v2: a created note is editable immediately and locks under the real DEK", async () => {
   const { plugin, harness } = await boot();
   const { createKeyring } = await import("../src/core/keyring");
   const { generateRecoveryKey } = await import("../src/core/recovery");
-  const { parseNoteRef } = await import("../src/core/format");
+  const { noteBodyState } = await import("../src/core/format");
 
   const vaultId = "23450000-2222-4333-8444-555555555555";
-  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), {
-    iterations: 100_000,
-  });
+  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), { iterations: 100_000 });
   plugin.vaultIdentifier = vaultId;
   plugin.hasKeyring = async () => true;
   plugin.unlockService.requireKeyring = async () => keyring;
@@ -1692,36 +1622,25 @@ test("a created note is encrypted with the real DEK from the first byte", async 
   await plugin.newSealedNote(undefined, "测试笔记");
 
   const created = [...harness.files.keys()].find((p) => p.endsWith(".sealed.md"))!;
-  const payloadPath = [...harness.files.keys()].find((p) => p.endsWith(".sealedpayload"))!;
-
-  // The payload is real before a single character is typed: there is no window
-  // in which the note exists but its ciphertext is a throwaway envelope.
-  assert.equal(
-    await plugin.notes.readPlaintext({ path: payloadPath } as any, dek, vaultId),
-    "",
-    "empty body sealed under the real DEK",
-  );
+  assert.equal(harness.files.get(created), "", "new note opens as a clean blank editor");
   assert.ok(plugin.sessions.get(created), "session established at creation");
   assert.ok(plugin.isUnlocked(created), "note is editable right away");
 
-  const refLine = harness.files.get(created)!.split("\n")[0];
-  harness.files.set(created, `${refLine}\n# 我的新秘密\n\n正文内容`);
-  // Saving must never reach for a credential again: the DEK is already here.
+  harness.files.set(created, "# 我的新秘密\n\n正文内容");
   let promptsDuringSave = 0;
-  plugin.unlockService.dekFor = async () => {
-    promptsDuringSave++;
-    return null;
-  };
-  await plugin.flushNote(created);
+  plugin.unlockService.dekFor = async () => { promptsDuringSave++; return null; };
+  await plugin.flushNote(created); // no-op in v2: the body is already the live document
   assert.equal(promptsDuringSave, 0, "autosave is silent - no dialog mid-typing");
 
+  await plugin.lockNote(created);
+  const locked = harness.files.get(created)!;
+  assert.equal(noteBodyState(locked), "sealed", "lock sealed the very same file");
+  assert.ok(!locked.includes("我的新秘密"), "no plaintext left on disk");
   assert.equal(
-    await plugin.notes.readPlaintext({ path: payloadPath } as any, dek, vaultId),
+    await plugin.notes.readPlaintext({ path: created } as any, dek, vaultId),
     "# 我的新秘密\n\n正文内容",
-    "flush writes under the same key, with no prompt",
+    "typed text preserved under the same DEK",
   );
-  assert.ok(parseNoteRef(harness.files.get(created)!), "ref intact");
-  assert.ok(harness.files.get(created)!.includes("我的新秘密"), "body stays editable");
   plugin.onunload();
 });
 
@@ -1791,7 +1710,7 @@ test("unlocking never switches a sidebar leaf", async () => {
 
   await plugin.unlockNote(file);
 
-  assert.ok(harness.files.get(file.path)!.includes("<!--"), "body revealed in place");
+  assert.equal(harness.files.get(file.path), "", "body revealed as bare plaintext, no annotation");
   assert.deepEqual(sealedSwitches, [`${file.path}->markdown`], "the note's own leaf switched to markdown");
   assert.equal(harness.registered.activeLeafSwitches.length, 0, "sidebar leaf was NOT used");
   plugin.onunload();
@@ -1826,11 +1745,11 @@ test("opening a sealed note switches only its own leaf to the padlock, not other
   plugin.onunload();
 });
 
-test("renaming a private note without .sealed.md restores the suffix and keeps its ID", async () => {
+test("v2: renaming a private note without .sealed.md restores the suffix; ciphertext travels with it", async () => {
   const { plugin, harness } = await boot();
   const { createKeyring } = await import("../src/core/keyring");
   const { generateRecoveryKey } = await import("../src/core/recovery");
-  const { parseNoteRef } = await import("../src/core/format");
+  const { noteBodyState } = await import("../src/core/format");
 
   const vaultId = "78900000-2222-4333-8444-555555555555";
   const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), {
@@ -1838,15 +1757,15 @@ test("renaming a private note without .sealed.md restores the suffix and keeps i
   });
   plugin.vaultIdentifier = vaultId;
   const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/daily", "daily");
-  const ref = parseNoteRef(harness.files.get(file.path)!)!;
-  assert.ok(plugin.notes.refForPath(file.path), "ID cached under original path");
+  const lockedBody = harness.files.get(file.path)!;
+  assert.equal(noteBodyState(lockedBody), "sealed", "body is the envelope before rename");
 
   const renameHook = harness.registered.events.find((e) => e.name === "vault:rename");
   assert.ok(renameHook, "rename hook registered");
 
   // User renames to "summary.md" (drops .sealed). Simulate vault rename + event.
   harness.files.delete(file.path);
-  harness.files.set("Private/summary.md", "# 内容\n");
+  harness.files.set("Private/summary.md", lockedBody);
   await renameHook!.fn({ path: "Private/summary.md", basename: "summary", extension: "md" }, file.path);
   for (let i = 0; i < 50 && !harness.files.has("Private/summary.sealed.md"); i++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1854,7 +1773,11 @@ test("renaming a private note without .sealed.md restores the suffix and keeps i
 
   assert.ok(harness.files.has("Private/summary.sealed.md"), "suffix restored automatically");
   assert.equal(harness.files.has("Private/summary.md"), false, "old no-suffix path gone");
-  assert.equal(plugin.notes.refForPath("Private/summary.sealed.md"), ref, "ID cache moved to new path");
+  assert.equal(
+    await plugin.notes.readPlaintext({ path: "Private/summary.sealed.md" } as any, dek, vaultId),
+    "",
+    "ciphertext followed the rename with no sidecar to rewire",
+  );
   plugin.onunload();
 });
 
@@ -1918,15 +1841,14 @@ test("the progress pill never outlives the operation that raised it", async () =
   plugin.onunload();
 });
 
-test("saving a note really replaces its payload and leaves no scratch files", async () => {
+test("v2: locking really replaces the body envelope and leaves no scratch files", async () => {
   const { plugin, harness } = await boot();
   const { createKeyring } = await import("../src/core/keyring");
   const { generateRecoveryKey } = await import("../src/core/recovery");
+  const { noteBodyState } = await import("../src/core/format");
 
   const vaultId = "ef010000-2222-4333-8444-555555555555";
-  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), {
-    iterations: 100_000,
-  });
+  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), { iterations: 100_000 });
   plugin.vaultIdentifier = vaultId;
   plugin.hasKeyring = async () => true;
   plugin.unlockService.requireKeyring = async () => keyring;
@@ -1934,21 +1856,17 @@ test("saving a note really replaces its payload and leaves no scratch files", as
 
   await plugin.newSealedNote(undefined, "替换");
   const created = [...harness.files.keys()].find((p) => p.endsWith(".sealed.md"))!;
-  const payloadPath = [...harness.files.keys()].find((p) => p.endsWith(".sealedpayload"))!;
-  const before = harness.files.get(payloadPath)!;
+  const before = harness.files.get(created)!;
 
-  const refLine = harness.files.get(created)!.split("\n")[0];
-  harness.files.set(created, `${refLine}\n第二次保存也必须落盘\n`);
-  await plugin.flushNote(created);
+  harness.files.set(created, "第二次保存也必须落盘\n");
+  await plugin.lockNote(created);
 
-  // The regression: atomicWrite renamed a temp file onto an existing payload,
-  // which Obsidian refuses ("Destination file already exists!"). The payload
-  // therefore never changed and a .tmp was left behind on every save.
-  assert.notEqual(harness.files.get(payloadPath), before, "payload was actually rewritten");
+  assert.notEqual(harness.files.get(created), before, "body envelope was actually rewritten");
+  assert.equal(noteBodyState(harness.files.get(created)!), "sealed");
   assert.equal(
-    await plugin.notes.readPlaintext({ path: payloadPath } as any, dek, vaultId),
+    await plugin.notes.readPlaintext({ path: created } as any, dek, vaultId),
     "第二次保存也必须落盘\n",
-    "payload decrypts to what the user typed",
+    "new envelope decrypts to what the user typed",
   );
   const scratch = [...harness.files.keys()].filter((p) => /\.(tmp|old)$/.test(p));
   assert.deepEqual(scratch, [], "no .tmp/.old scratch files left behind");
@@ -1971,9 +1889,9 @@ test("reopening a note whose first save never landed keeps the typed text", asyn
 
   await plugin.newSealedNote(undefined, "没保存就退出");
   const created = [...harness.files.keys()].find((p) => p.endsWith(".sealed.md"))!;
-  const refLine = harness.files.get(created)!.split("\n")[0];
-  // Typed, but the save never reached disk (the bug this session fixes).
-  harness.files.set(created, `${refLine}\n这段字不能丢\n`);
+  // Typed but not locked: in v2 the body IS the live document, so the text is
+  // already on disk as plaintext. No ref line to preserve any more.
+  harness.files.set(created, "这段字不能丢\n");
 
   // Restart: a brand-new plugin instance over the same files.
   const { default: PluginClass } = await import("../src/main");
@@ -2004,17 +1922,18 @@ test("reopening a note whose first save never landed keeps the typed text", asyn
     "the plaintext recovered from disk survives opening",
   );
 
-  // And the next save finishes what the failed one started: the text lands in
-  // the payload under the real DEK, so the note is genuinely encrypted again.
-  restarted.unlockService.dekFor = async () => dek;
+  // Locking finishes what an autosave used to do: the text is sealed into the
+  // same body under the real DEK.
   restarted.unlockService.requireKeyring = async () => keyring;
-  await restarted.flushNote(created);
-  const payloadPath = [...h2.files.keys()].find((p) => p.endsWith(".sealedpayload"))!;
+  const session = restarted.sessions.get(created);
+  restarted.sessions.put(created, dek, session?.providerId ?? "test", keyring);
+  await restarted.lockNote(created);
   assert.equal(
-    await restarted.notes.readPlaintext({ path: payloadPath } as any, dek, vaultId),
+    await restarted.notes.readPlaintext({ path: created } as any, dek, vaultId),
     "这段字不能丢\n",
-    "the retried save puts the text into the payload under the real DEK",
+    "the typed text is encrypted into the note body under the real DEK",
   );
+  assert.ok(!h2.files.get(created)!.includes("这段字不能丢"), "no plaintext remains in the body");
 
   restarted.onunload();
   plugin.onunload();
@@ -2241,11 +2160,14 @@ test("a new private note puts the caret below the ID comment", async () => {
   await plugin.newSealedNote(undefined, "光标测试");
   await new Promise((resolve) => setTimeout(resolve, 200));
 
-  const lines = harness.files.get(path)!.split("\n");
-  assert.ok(lines[0].includes("sealed-note:ref="), "ID comment is line 1");
-  assert.equal(lines[1], "", "the body starts on an empty line 2");
-  assert.deepEqual(caret, { line: 1, ch: 0 }, "caret waits on the line after the comment");
-  assert.equal(focused, true, "the editor is focused so typing goes to the note");
+  // v2: the new note is pure plaintext. No ID comment means no caret dance -
+  // line 1 is exactly where the user starts typing.
+  assert.equal(harness.files.get(path), "", "body is empty with no annotation at all");
+  assert.equal(
+    harness.files.get(path)!.includes("sealed-note:ref"),
+    false,
+    "no ID comment to accidentally delete",
+  );
   plugin.onunload();
 });
 
@@ -2267,7 +2189,9 @@ test("the lock policy decides which focus loss re-locks a note", async () => {
   await plugin.notes.writePlaintext(file, dek, vaultId, vaultId, "# 私密内容\n", keyring);
 
   const unlock = async () => {
-    plugin.sessions.put(file.path, dek, "test");
+    // Carry the key copy into the session, as unlockNote() does: once this
+    // single note is revealed there is no on-disk key source left.
+    plugin.sessions.put(file.path, dek, "test", keyring);
     await plugin.notes.revealNote(file, dek, vaultId);
   };
   const blur = async () => {

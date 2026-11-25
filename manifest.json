@@ -1,9 +1,9 @@
 {
   "id": "sealed-note",
   "name": "Sealed Note",
-  "version": "1.2.0",
+  "version": "2.0.0",
   "minAppVersion": "1.5.0",
-  "description": "Encrypt selected notes and inline blocks with Obsidian's native editor. Password, TOTP, or recovery key unlock - no keyring file, each note has its own encrypted payload.",
+  "description": "Encrypt selected notes and inline blocks with Obsidian's native editor. Password, TOTP, or recovery key unlock - no keyring file, no sidecar: each note's own body holds the ciphertext.",
   "author": "PCXX",
   "authorUrl": "https://github.com/njuptlzf",
   "isDesktopOnly": false

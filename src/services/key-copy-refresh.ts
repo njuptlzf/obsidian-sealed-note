@@ -17,7 +17,7 @@
 
 import { App, TFile } from "obsidian";
 import { KeyringData, keyCopyFromKeyringData, parseKeyring } from "../core/keyring";
-import { keyCopiesEqual, parseNoteRef } from "../core/format";
+import { keyCopiesEqual, noteBodyState } from "../core/format";
 import { SealedNoteStore } from "../storage/sealed-note-store";
 import { log } from "../util/log";
 
@@ -68,11 +68,12 @@ export class KeyCopyRefreshService {
       if (!shouldContinue()) break;
 
       try {
-        // A ref-based note is represented by its payload file; do not count
-        // the same key copy twice.
+        // A locked note's body IS the envelope; unlocked plaintext is not a
+        // key source. A v1 sidecar note is represented by its payload, so skip
+        // the note itself to avoid counting the same copy twice.
         if (this.notes.isSealedPath(file.path)) {
-          const noteRaw = await this.app.vault.read(file);
-          if (parseNoteRef(noteRaw)) continue;
+          const noteRaw = await this.app.vault.read(file).catch(() => "");
+          if (noteBodyState(noteRaw) !== "sealed") continue;
         }
         const envelope = await this.notes.tryReadEnvelope(file);
         if (!envelope) {
@@ -120,8 +121,8 @@ export class KeyCopyRefreshService {
       if (!this.notes.isKeySourcePath(file.path)) continue;
       try {
         if (this.notes.isSealedPath(file.path)) {
-          const noteRaw = await this.app.vault.read(file);
-          if (parseNoteRef(noteRaw)) continue;
+          const noteRaw = await this.app.vault.read(file).catch(() => "");
+          if (noteBodyState(noteRaw) !== "sealed") continue;
         }
         const env = await this.notes.tryReadEnvelope(file);
         if (env?.keys && !keyCopiesEqual(env.keys, copy) && env.keys.epoch <= copy.epoch) stale++;

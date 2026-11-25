@@ -221,38 +221,6 @@ export class SealedNoteSettingTab extends PluginSettingTab {
       );
 
     new Setting(parent)
-      .setName(t("settings.payloadDir"))
-      .setDesc(t("settings.payloadDirDesc"))
-      .addText((text) =>
-        text
-          .setPlaceholder("sealed-data")
-          .setValue(this.plugin.settingsData.payloadDir)
-          .onChange(async (value) => {
-            this.plugin.settingsData.payloadDir = value.trim();
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(parent)
-      .setName(t("settings.deletePayload"))
-      .setDesc(t("settings.deletePayloadDesc"))
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settingsData.deletePayloadWithNote).onChange(async (value) => {
-          this.plugin.settingsData.deletePayloadWithNote = value;
-          await this.plugin.saveSettings();
-        }),
-      );
-
-    new Setting(parent)
-      .setName(t("settings.cleanOrphans"))
-      .setDesc(t("settings.cleanOrphansDesc"))
-      .addButton((btn) =>
-        btn.setButtonText(t("settings.cleanOrphansButton")).onClick(async () => {
-          await this.plugin.cleanOrphanPayloads();
-        }),
-      );
-
-    new Setting(parent)
       .setName(t("settings.showBadges"))
       .setDesc(t("settings.showBadgesDesc"))
       .addToggle((toggle) =>

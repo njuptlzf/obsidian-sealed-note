@@ -35,11 +35,11 @@ import { ConfirmModal, RecoveryKeyModal, SetupModal, UnlockModal } from "./ui/mo
 import { registerEncryptedCodeBlocks } from "./inline/codeblock";
 import { registerInlinePayloads } from "./inline/postprocessor";
 import { generateRecoveryKey, recoveryKeyText, groupRecovery } from "./core/recovery";
-import { createKeyring, createKeyringWithoutPassword, keyFingerprint, newVaultId, SLOT_PASSWORD, SLOT_TOTP, SLOT_PASSWORD_TOTP, KeyringData, setSlot } from "./core/keyring";
+import { createKeyring, createKeyringWithoutPassword, formatKeyringFromCopy, keyFingerprint, newVaultId, SLOT_PASSWORD, SLOT_TOTP, SLOT_PASSWORD_TOTP, KeyringData, setSlot } from "./core/keyring";
 import { generateTotpSecret, totpUri, formatSecret } from "./core/totp";
 import { describeError, Err } from "./util/errors";
 import { log, setLogLevel } from "./util/log";
-import { findUnsealedBlocks, openInline, parseNoteRef, serializeNoteRevealed } from "./core/format";
+import { findUnsealedBlocks, noteBodyState, openInline, parseNoteRef } from "./core/format";
 import { TotpSetupModal } from "./ui/totp-modal";
 import { CandidatePickerModal, SecretPromptModal } from "./ui/recovery-modals";
 import { UnlockModeModal, PasswordPromptModal } from "./ui/mode-modals";
@@ -47,15 +47,10 @@ import { sealWithDevice } from "./core/device";
 import { SeedImportModal } from "./ui/seed-import-modal";
 import { VaultRecoveryService } from "./services/vault-recovery";
 import { KeyCopyRefreshService } from "./services/key-copy-refresh";
-import { RestoreService } from "./services/restore-service";
-import { RestoreModal } from "./ui/restore-modal";
 import { NameModal } from "./ui/name-modal";
 import { BusyOverlay } from "./ui/busy";
 
 const SEALED_ICON = "lock";
-/** how often a freshly created note retries to place the caret (see focusBodyLine) */
-const CARET_ATTEMPTS = 10;
-const CARET_RETRY_MS = 40;
 
 export default class SealedNotePlugin extends Plugin {
   private readonly log = log.child("plugin");
@@ -70,7 +65,6 @@ export default class SealedNotePlugin extends Plugin {
   clipboard!: ClipboardService;
   recovery!: VaultRecoveryService;
   keyCopies!: KeyCopyRefreshService;
-  restoreService!: RestoreService;
 
   private vaultIdentifier = "";
   /** initial keyring, held in memory until the first note can carry it */
@@ -134,7 +128,7 @@ export default class SealedNotePlugin extends Plugin {
 
     // Order matters: NoteKeyringStore depends on SealedNoteStore for the
     // ".sealed.md" path rule. Construct the store first.
-    this.notes = new SealedNoteStore(this.app, dataDir, () => this.settingsData.payloadDir);
+    this.notes = new SealedNoteStore(this.app, dataDir);
     this.notes.setPlaceholderHint(t("note.placeholder"));
     // Old builds kept plaintext working copies in a visible folder; wipe the
     // leftovers and warn about notes still revealed from a crash.
@@ -145,7 +139,6 @@ export default class SealedNotePlugin extends Plugin {
     this.clipboard = new ClipboardService();
     this.recovery = new VaultRecoveryService(this.app, this.notes);
     this.keyCopies = new KeyCopyRefreshService(this.app, this.notes);
-    this.restoreService = new RestoreService(this.app, this.notes);
 
     this.unlockService = new UnlockService(this.keyringStore, this.sessions);
     this.unlockService.setUi(() => ({
@@ -506,17 +499,6 @@ export default class SealedNotePlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "restore-annotation",
-      name: t("cmd.restoreAnnotation.name"),
-      checkCallback: (checking) => {
-        const file = this.app.workspace.getActiveFile();
-        if (!file || !this.notes.isSealedPath(file.path)) return false;
-        if (!checking) void this.guard(() => this.restoreAnnotation(file));
-        return true;
-      },
-    });
-
-    this.addCommand({
       id: "show-recovery-key",
       name: t("cmd.recovery.name"),
       callback: () => void this.guard(() => this.showRecoveryKey()),
@@ -535,15 +517,9 @@ export default class SealedNotePlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "migrate-to-payloads",
+      id: "migrate-to-single-file",
       name: t("cmd.migrate.name"),
-      callback: () => void this.guard(() => this.migrateToPayloads()),
-    });
-
-    this.addCommand({
-      id: "clean-orphan-payloads",
-      name: t("cmd.cleanOrphans.name"),
-      callback: () => void this.guard(() => this.cleanOrphanPayloads()),
+      callback: () => void this.guard(() => this.migrateToSingleFile()),
     });
 
     this.addCommand({
@@ -636,12 +612,6 @@ export default class SealedNotePlugin extends Plugin {
         );
 
         if (isSealed) {
-          menu.addItem((item) =>
-            item
-              .setTitle(t("cmd.restoreAnnotation.name"))
-              .setIcon("file-restore")
-              .onClick(() => void this.guard(() => this.restoreAnnotation(file))),
-          );
           const unlocked = this.isUnlocked(file.path);
           menu.addItem((item) =>
             item
@@ -764,7 +734,6 @@ export default class SealedNotePlugin extends Plugin {
         if (file.path === this.creatingNotePath) return;
         // A workspace-restored tab can point at a note deleted while closed.
         if (!this.app.vault.getAbstractFileByPath(file.path)) {
-          this.notes.forgetPath(file.path);
           this.sessions.lock(file.path);
           return;
         }
@@ -1058,8 +1027,6 @@ export default class SealedNotePlugin extends Plugin {
       // is not treated as "left the note".
       await new Promise((resolve) => window.setTimeout(resolve, 50));
       this.refreshStatusBar();
-      // Start typing below the ID comment, never inside it.
-      this.focusBodyLine(file.path);
     } finally {
       this.creatingNotePath = null;
     }
@@ -1068,8 +1035,6 @@ export default class SealedNotePlugin extends Plugin {
 
   /** Write an empty revealed body for a brand-new note. */
   private async revealBlank(file: TFile): Promise<void> {
-    const ref = this.notes.refForPath(file.path) ?? (await this.refOf(file));
-    if (!ref) throw Err.io(`无法读取笔记 ID：${file.path}`);
     // "Blank" describes the expected state, it is not a licence to clear the
     // body. Only called right after create() now, so this can never fire - kept
     // as a guard because writing "" over a body that holds text is the one
@@ -1079,7 +1044,7 @@ export default class SealedNotePlugin extends Plugin {
       this.log.warn("reveal_blank_on_nonempty_body", { note: file.path, chars: existing.length });
       return;
     }
-    await this.markSelfWrite(file.path, () => this.app.vault.modify(file, serializeNoteRevealed(ref, "")));
+    await this.markSelfWrite(file.path, () => this.app.vault.modify(file, ""));
   }
 
   /**
@@ -1150,26 +1115,36 @@ export default class SealedNotePlugin extends Plugin {
       // half-finished lock can leave a session with a still-placeholder body.
       // revealNote is idempotent - a revealed body is left untouched, which is
       // also what keeps text typed before a crash from being overwritten.
-      const existing = this.sessions.get(noteFile.path)?.dek ?? null;
-      const dek = existing ?? (await this.unlockService.dekFor(noteFile.path, { subject: noteFile.basename }));
+      const existingSession = this.sessions.get(noteFile.path);
+      const dek = existingSession?.dek ?? (await this.unlockService.dekFor(noteFile.path, { subject: noteFile.basename }));
       if (!dek) return; // user cancelled
+
+      // Capture the key copy from the locked envelope BEFORE reveal replaces
+      // it with plaintext. Once a lone note is unlocked there is no key source
+      // left on disk, so lock/flush must reuse this in-memory copy.
+      let sessionKr = existingSession?.keyring ?? null;
+      const envelope = await this.notes.tryReadEnvelope(noteFile);
+      if (envelope?.keys) {
+        sessionKr = formatKeyringFromCopy(envelope.keys);
+        this.vaultIdentifier = envelope.keys.vaultId;
+      }
 
       try {
         await this.notes.revealNote(noteFile, dek, this.vaultId());
       } catch (error) {
         if ((error as any)?.code !== "E_BAD_ENVELOPE") throw error;
-        // A note damaged by an external editor: seal its bytes before showing.
+        // A note damaged by an external editor: seal its bytes first, then
+        // reveal them. writePlaintext now writes the envelope into THIS file,
+        // so the following revealNote turns it back into editable plaintext.
         const raw = await this.notes.readCiphertext(noteFile);
         const kr = await this.unlockService.requireKeyring();
-        await this.notes.writePlaintext(noteFile, dek, this.vaultId(), this.vaultId(), raw, kr);
-        new Notice(
-          "这个文件不是有效的密文信封（可能被其他编辑器写成了明文）。已把当前内容加密保存，旧文件已备份。",
-          10000,
+        await this.markSelfWrite(noteFile.path, () =>
+          this.notes.writePlaintext(noteFile, dek, this.vaultId(), this.vaultId(), raw, kr),
         );
-        const ref = this.notes.refForPath(noteFile.path) ?? (await this.refOf(noteFile));
-        if (ref) await this.markSelfWrite(noteFile.path, () => this.app.vault.modify(noteFile, serializeNoteRevealed(ref, raw)));
+        await this.notes.revealNote(noteFile, dek, this.vaultId());
+        new Notice(t("notice.badEnvelopeRepaired"), 10000);
       }
-      this.sessions.put(noteFile.path, dek, "unlock");
+      this.sessions.put(noteFile.path, dek, "unlock", sessionKr ?? undefined);
       await this.showAsMarkdown(noteFile.path);
       this.rememberLeafFor(noteFile.path);
       this.refreshStatusBar();
@@ -1177,11 +1152,6 @@ export default class SealedNotePlugin extends Plugin {
     } finally {
       this.unlockingNotes.delete(noteFile.path);
     }
-  }
-
-  private async refOf(noteFile: TFile): Promise<string | null> {
-    const raw = await this.app.vault.read(noteFile).catch(() => "");
-    return parseNoteRef(raw);
   }
 
   /**
@@ -1233,7 +1203,9 @@ export default class SealedNotePlugin extends Plugin {
         new Notice(t("notice.lockNoKey"), 8000);
         return;
       }
-      const kr = await this.unlockService.requireKeyring();
+      // Prefer the copy captured at unlock: this note's own body is plaintext
+      // now, so a vault with only this one note has no on-disk key source.
+      const kr = this.sessions.get(notePath)?.keyring ?? (await this.unlockService.requireKeyring());
       this.vaultIdentifier = kr.vaultId;
 
       await this.markSelfWrite(notePath, () => this.notes.reSealNote(file, dek, kr.vaultId, kr.vaultId, kr));
@@ -1246,34 +1218,14 @@ export default class SealedNotePlugin extends Plugin {
     }
   }
 
-  /** Flush the revealed body into the payload WITHOUT locking (autosave). */
-  async flushNote(notePath: string): Promise<void> {
-    if (this.savingNotes.has(notePath)) return;
-    // Defence in depth (see lockNote): only a private note has a revealed
-    // plaintext body. A plain note's session is a DEK cache, never flushable.
-    if (!this.notes.isSealedPath(notePath)) return;
-    const file = this.app.vault.getAbstractFileByPath(notePath);
-    if (!(file instanceof TFile)) return;
-    if (!this.isUnlocked(notePath)) return;
-
-    const dek = this.sessions.get(notePath)?.dek ?? null;
-    if (!dek) {
-      // An autosave must never raise a dialog in the middle of typing. The text
-      // is still in the body and lock will seal it, so skipping this flush is
-      // recoverable; interrupting the user is not.
-      this.log.warn("flush_without_key", { note: notePath });
-      return;
-    }
-    const kr = await this.unlockService.requireKeyring();
-    this.vaultIdentifier = kr.vaultId;
-    this.savingNotes.add(notePath);
-    try {
-      const plaintext = await this.notes.readRevealedBody(file);
-      await this.notes.writePlaintext(file, dek, kr.vaultId, kr.vaultId, plaintext, kr);
-      this.log.info("note_flushed", { note: notePath });
-    } finally {
-      this.savingNotes.delete(notePath);
-    }
+  /**
+   * No-op in the single-file layout: the revealed body IS the live document
+   * that Obsidian autosaves. There is no second location to flush into, and
+   * encrypting here would overwrite what the user is still typing. The only
+   * moment that writes ciphertext is lockNote().
+   */
+  async flushNote(_notePath: string): Promise<void> {
+    return;
   }
 
   private scheduleFlush(notePath: string): void {
@@ -1353,36 +1305,6 @@ export default class SealedNotePlugin extends Plugin {
     await ws.revealLeaf?.(leaf);
   }
 
-  /**
-   * Put the caret on the first line AFTER the invisible ID comment.
-   *
-   * A brand-new note's body is just `<!-- sealed-note:ref=… -->` plus a trailing
-   * newline, and an empty editor parks the caret at offset 0 - inside the
-   * comment. Typing there would eat the note's ID, and backspacing would delete
-   * the annotation outright. Placing the caret on the next line also matches
-   * where a user expects to start writing.
-   *
-   * The editor mounts a moment after the leaf switch, so this retries briefly
-   * instead of assuming the view is ready; it never throws.
-   */
-  private focusBodyLine(path: string): void {
-    const place = (attempt: number): void => {
-      const view = this.markdownViewFor(path);
-      const editor = view?.editor;
-      // Guard the document as well: a view can be mounted before its text is
-      // loaded, and a caret placed then would land back inside the comment.
-      if (!view || !editor || editor.lineCount() < 2) {
-        if (attempt >= CARET_ATTEMPTS) return;
-        window.setTimeout(() => place(attempt + 1), CARET_RETRY_MS);
-        return;
-      }
-      const line = editor.lineCount() - 1;
-      editor.setCursor({ line, ch: (editor.getLine(line) ?? "").length });
-      editor.focus();
-    };
-    place(0);
-  }
-
   /** The Markdown view currently showing `path`, if any. */
   private markdownViewFor(path: string): MarkdownView | null {
     const active = this.app.workspace.getActiveViewOfType(MarkdownView);
@@ -1407,8 +1329,12 @@ export default class SealedNotePlugin extends Plugin {
    * turned into a padlock. (Using activeLeaf here was the old overwrite bug.)
    */
   private async forcePadlockOnFileLeaf(file: TFile): Promise<void> {
-    // An unlocked note is legitimately edited in the Markdown view right now.
-    if (this.isUnlocked(file.path)) return;
+    // Content, not session memory, decides: a body holding plaintext is
+    // already open for editing (no prompt); a body holding the envelope is
+    // locked, so show the padlock. This also survives a crash that dropped the
+    // session while leaving a revealed body on disk.
+    const raw = await this.app.vault.read(file).catch(() => "");
+    if (this.notes.isRevealedText(raw)) return;
     let shown = await this.padlockMatchingLeaves(file.path);
     if (!shown) {
       // file-open fires before Obsidian finishes mounting the native Markdown
@@ -1801,18 +1727,6 @@ export default class SealedNotePlugin extends Plugin {
     this.log.info("document_decrypted", { path: file.path, ...{ fenced: result.fenced, inline: result.inline } });
   }
 
-  /** Open the two-step recovery-key / pick-candidate dialog for a sealed note. */
-  async restoreAnnotation(file: TFile): Promise<void> {
-    new RestoreModal(this.app, file.basename, {
-      collect: (recovery) => this.restoreService.collectCandidates(recovery.trim()),
-      choose: async (candidate) => {
-        await this.restoreService.restore(file, candidate);
-        this.notes.forgetPath(file.path);
-        this.refreshStatusBar();
-      },
-    }).open();
-  }
-
   /* ---------------- recovery / totp ---------------- */
 
   /**
@@ -1839,16 +1753,44 @@ export default class SealedNotePlugin extends Plugin {
     }
   }
 
-  /** Move old embedded envelopes into one sidecar payload per note. */
-  async migrateToPayloads(): Promise<void> {
+  /**
+   * v1 (ref annotation + sealed-data payload) -> v2 (body envelope).
+   * Each note is an independent, idempotent transaction: write the envelope
+   * into the body first, then delete the payload. A failure leaves the v1 note
+   * untouched and the command can be re-run safely.
+   */
+  async migrateToSingleFile(): Promise<void> {
     const notes = this.app.vault.getFiles().filter((f) => this.notes.isSealedPath(f.path));
     let migrated = 0;
     let skipped = 0;
     let failed = 0;
     for (const file of notes) {
       try {
-        if (await this.notes.migrateLegacy(file)) migrated++;
-        else skipped++;
+        const raw = await this.app.vault.read(file).catch(() => "");
+        if (noteBodyState(raw) !== "sidecar-ref") {
+          // Already v2, or an unlocked plaintext body: never touch either.
+          skipped++;
+          continue;
+        }
+        const ref = parseNoteRef(raw);
+        if (!ref) {
+          skipped++;
+          continue;
+        }
+        const source = await this.notes.readPayload(ref);
+        if (!source) throw new Error(t("notice.payloadMissingShort"));
+        // 1) write envelope into the note body (the new single source of truth)
+        await this.markSelfWrite(file.path, () =>
+          this.notes.replaceBodyWithEnvelope(file, source.envelope),
+        );
+        // 2) only now remove the old sidecar. If this fails the note is still
+        //    fully valid v2; the leftover payload is harmless and can be
+        //    deleted manually.
+        await this.notes.deletePayload(ref);
+        // Drop session state so the next unlock reads the new body.
+        this.sessions.lock(file.path);
+        migrated++;
+        this.log.info("note_migrated_to_single_file", { path: file.path, ref });
       } catch (error) {
         failed++;
         this.log.warn("migrate_failed", { path: file.path, error: String(error) });
@@ -1903,10 +1845,8 @@ export default class SealedNotePlugin extends Plugin {
       }
     }
 
-    // Move cached ID / session / pending state from the old path to the final
-    // path. The body (and its ref line) travels with the file, so payloads are
-    // unaffected; only our in-memory maps need re-keying.
-    this.notes.moveRef(oldPath, finalPath);
+    // The ciphertext lives in the note body, so a rename needs no payload
+    // rewrite and no ID cache. Only the in-memory session follows the path.
     const session = this.sessions.get(oldPath);
     if (session) {
       this.sessions.put(finalPath, session.dek, session.providerId);
@@ -1915,7 +1855,7 @@ export default class SealedNotePlugin extends Plugin {
     if (this.busyPath === oldPath) this.busyPath = finalPath;
   }
 
-  /** Delete the payload when its note goes away (default on). */
+  /** Drop in-memory state for a deleted note; ciphertext died with the file. */
   private async onNoteDeleted(file: TAbstractFile): Promise<void> {
     if (!file || typeof file.path !== "string") return;
     if (!this.notes.isSealedPath(file.path)) {
@@ -1927,59 +1867,12 @@ export default class SealedNotePlugin extends Plugin {
       }
       return;
     }
-    // Drop any in-memory state for the vanished note.
     const timer = this.saveTimers.get(file.path);
     if (timer) window.clearTimeout(timer);
     this.saveTimers.delete(file.path);
     this.sessions.lock(file.path);
     this.releaseBusy(file.path);
-    // Always drop the cached ref when a note disappears, even when we keep the
-    // ciphertext: otherwise the payload still looks "referenced" and the
-    // clean-orphans command will never find it.
-    const ref =
-      this.notes.refForPath(file.path) ??
-      parseNoteRef(await this.app.vault.adapter.read(file.path).catch(() => ""));
-    this.notes.forgetPath(file.path);
     this.refreshStatusBar();
-    if (!this.settingsData.deletePayloadWithNote) return;
-    if (!ref) return;
-    if (await this.notes.deletePayload(ref)) {
-      this.log.info("payload_deleted_with_note", { note: file.path, ref });
-    }
-  }
-
-  /** Remove payload files that no note refers to any more. */
-  async cleanOrphanPayloads(): Promise<void> {
-    const orphans = await this.notes.orphanPayloads();
-    if (orphans.length === 0) {
-      new Notice(t("notice.noOrphans"));
-      return;
-    }
-    const ok = await new Promise<boolean>((resolve) => {
-      new ConfirmModal(
-        this.app,
-        {
-          title: t("confirm.cleanOrphansTitle"),
-          body: t("confirm.cleanOrphansBody", { n: orphans.length, list: orphans.slice(0, 10).map((f) => f.path).join("\n") }),
-          confirmText: t("confirm.cleanOrphansOk"),
-          danger: true,
-          typeToConfirm: "DELETE",
-        },
-        resolve,
-      ).open();
-    });
-    if (!ok) return;
-
-    let removed = 0;
-    for (const file of orphans) {
-      try {
-        await this.app.vault.adapter.remove(file.path);
-        removed++;
-      } catch (error) {
-        this.log.warn("orphan_payload_remove_failed", { path: file.path, error: String(error) });
-      }
-    }
-    new Notice(t("notice.orphansCleaned", { n: removed, fail: orphans.length - removed }));
   }
 
   /**

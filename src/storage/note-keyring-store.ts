@@ -2,11 +2,9 @@
  * Keyring WITHOUT a keyring file.
  *
  * There is no keyring.json any more. The wrapped vault key lives in the `keys`
- * field of every note's sealed payload (legacy notes without a sidecar carry
- * the envelope in the note body itself), and those files are ordinary vault
- * files that
- * every sync tool handles (unlike `.obsidian/`, which Remotely Save excludes by
- * default and which a plugin reinstall wipes).
+ * field of every locked note's body envelope. Those notes are ordinary vault
+ * files that every sync tool handles (unlike `.obsidian/`, which Remotely Save
+ * excludes by default and which a plugin reinstall wipes).
  *
  * Consequences of this design:
  *
@@ -21,7 +19,7 @@
  */
 
 import { App, TFile, normalizePath } from "obsidian";
-import { KeyCopy, NoteEnvelope, keyCopiesEqual, parseNoteRef } from "../core/format";
+import { KeyCopy, NoteEnvelope, keyCopiesEqual, noteBodyState } from "../core/format";
 import {
   KeyringData,
   KeyringSlot,
@@ -51,16 +49,18 @@ export class NoteKeyringStore {
   /* read                                                               */
   /* ------------------------------------------------------------------ */
 
-  /** Every file that carries a key copy, newest generation first. */
+  /** Every locked note carrying a key copy, newest generation first. */
   async sources(): Promise<NoteKeyringSource[]> {
     const out: NoteKeyringSource[] = [];
     for (const file of this.app.vault.getFiles()) {
       if (!this.notes.isKeySourcePath(file.path)) continue;
       try {
-        // A note with a ref is represented by its payload; avoid duplicates.
+        // Unlocked notes hold plaintext, not an envelope: never a key source.
+        // v1 sidecar notes are represented by their payload, so skip the note
+        // itself and let the payload be counted exactly once.
         if (this.notes.isSealedPath(file.path)) {
-          const noteRaw = await this.app.vault.read(file);
-          if (parseNoteRef(noteRaw)) continue;
+          const noteRaw = await this.app.vault.read(file).catch(() => "");
+          if (noteBodyState(noteRaw) !== "sealed") continue;
         }
         const envelope = await this.notes.tryReadEnvelope(file);
         if (!envelope?.keys) continue;
