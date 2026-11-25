@@ -115,4 +115,8 @@ this.registerExtensions(["excalidraw"], VIEW_TYPE);  // 文件是 xxx.excalidraw
 - 56 个测试全绿（含 RFC 6238 官方向量、AAD 篡改、slot 互换、离线工具真实执行、插件 onload 冒烟、批量刷新字节不变、中断续跑）
 - 已构建部署到 `D:/work/obsidian/.obsidian/plugins/sealed-note`
 - 插件目录只有 main.js / manifest.json / styles.css / tools，**无密钥文件**
-- 待用户手动验证：Obsidian 重启后 `.sealed.md` 是否由插件视图打开
+- 用户手动验证发现并已修复（2026-11-23）：
+  - 仅 `registerExtensions(["sealed"])` 不足以保证 `.sealed.md` 专属视图，新建/从文件树打开时可能落到 Markdown 视图并显示密文 JSON、Ctrl+S 落盘明文；现在显式 `setViewState` + `file-open` 钩子强制切换视图。
+  - 笔记 `keys` 副本曾漏掉 TOTP 槽与模式信息，导致重启后只剩恢复密钥；已统一使用唯一的 key-copy 构造函数。
+  - 新建笔记默认内容加入说明性注释；非信封文件在解锁后自动加密兜底。
+  - 按用户要求进一步改为“占位笔记 + 独立 payload”：`.sealed.md` 只保留占位文字和 `<!-- sealed-note:ref=ID -->`；完整信封写入 `sealed-data/<ID>.sealedpayload`。用稳定 ID 而不是路径，笔记重命名/移动不失效；旧注释/裸 JSON 格式仍可读，保存或命令可迁移；离线解密器同步支持。

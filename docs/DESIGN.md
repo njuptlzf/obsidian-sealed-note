@@ -162,7 +162,14 @@ obsidian-encrypt-text/
 
 ### 3.3 隐私笔记 `.sealed`
 
-整个文件是一个 JSON 信封，**没有任何明文元数据**（标题来自文件名，是唯一泄露点，见 §8）：
+笔记本身只有占位文字和一个稳定 ID；JSON 信封放在 `sealed-data/<ID>.sealedpayload`，**笔记源码里没有任何 key/密文，也没有明文元数据**（标题来自文件名，是唯一泄露点，见 §8）：
+
+```
+🔒 这是一篇隐私笔记，请用插件解锁查看。
+<!-- sealed-note:ref=b1f2…uuid -->
+```
+
+payload 文件（原始 JSON）：
 
 ```json
 {
@@ -170,7 +177,8 @@ obsidian-encrypt-text/
   "kid": "b1f2…uuid",
   "salt": "b64 16B",
   "iv": "b64 12B",
-  "data": "b64 (ciphertext ‖ tag)"
+  "data": "b64 (ciphertext ‖ tag)",
+  "keys": { ... }
 }
 ```
 
@@ -214,11 +222,12 @@ export interface UnlockProvider {
 
 新增方式（未来：通行密钥 / 系统钥匙串 / 硬件令牌）只要实现该接口并在注册表登记，UI 自动出现选项——这是"面向接口"的落点。
 
-**会话与锁定**
-- DEK 只在内存（`Map<filePath, SessionEntry>`），条目含 `dek`、`unlockedAt`、`expiresAt`。
-- 默认策略 **严格按 PRD**：打开即索要密码；`active-leaf-change` 离开该笔记 → 立即 `lock(filePath)` 并清零缓冲区（明文填 0 后丢弃引用）。
-- 设置项可放宽为"保持 N 分钟"（N=0 即每次都要输）。默认 0。
-- 命令"锁定全部" + 状态栏按钮，一键清空所有会话。
+**会话与锁定（加锁时机，三级策略，`settings.lockPolicy`）**
+- DEK 只在内存（`Map<filePath, SessionEntry>`，条目含 `dek`/`providerId`）；lock 时明文填 0 后丢弃引用。
+- `blur`（默认，最严）：任何焦点离开都重封——`file-open`（含侧栏同标签换文件）、`active-leaf-change`（切标签/面板）、`window blur`（切应用）、`app.setting.open`（进设置页）四个钩子都跑锁定循环。
+- `close`：切走不锁（明文留在本体），只在该笔记的标签页被**销毁**时锁——解锁时记住所在 leaf，`layout-change` 清扫：无 leaf 显示该路径 且原 leaf 已不在 `iterateAllLeaves` → 锁定。
+- `session`：事件全不锁，仅 `onunload`（退出 Obsidian）与手动「锁定全部」结束会话。
+- 通用：手动「锁定当前/全部」（状态栏/命令/右键/丝带）、`onunload` 尽力 flush；无 DEK 时绝不弹密码框（记 warn，交给启动恢复扫描）。
 
 **限流**：连续 5 次失败 → 退避（1s/2s/4s…上限 60s），计数与 `lockedUntil` 写进 keyring.guard。诚实标注：这是防"有人在你电脑前瞎试"，不是防离线爆破。
 
@@ -227,11 +236,11 @@ export interface UnlockProvider {
 ## 5. 密码重置 / 恢复 流程
 
 ### 5.1 初始化（首次）
-1. 设置主密码（≥10 位，实时强度条；弱密码只警告不阻断）。
-2. 生成 DEK、password slot。
+1. **先选解锁模式**（纯密码 / 纯动态 / 密码+动态），再按模式收集凭据：纯动态不要求主密码。
+2. 生成 DEK。槽位按模式创建：纯密码 → password slot；纯动态 → totp slot（无密码通道）；**组合 → 只有 password-totp 组合槽，严格双因子，不建单独 password slot**。恢复密钥槽恒在。
 3. 生成恢复密钥：32 字节 → Base32 → 分 13 组展示（`K7QM-3XPD-…`），提供 **复制 / 下载 .txt / 打印样式**。
 4. **强制勾选**"我已离线保存恢复密钥，理解没有它无法恢复"才能完成。
-5. 写 keyring + 显示指纹。
+5. 密钥副本随第一篇笔记落盘（无 keyring 文件），显示指纹。旧版组合库遗留的单密码通道可在设置页「收口：删除单密码通道」一键关闭。
 
 ### 5.2 忘记密码（重置）
 ```
@@ -260,14 +269,18 @@ export interface UnlockProvider {
 - 右键：文件树（新建隐私笔记、解锁/锁定、解密整个文档）；编辑器（加密所选、解密所选、解密到剪贴板）。
 - 状态栏：`🔓 已解锁 · 3 篇` / `🔒 已锁定`，点击切换。
 
-**解锁弹窗**：标题"解锁《笔记名》"；provider 切换 tab（主密码 / 两步验证 / 恢复密钥）；底部固定小字警示；错误内联显示不弹窗；Enter 提交；失败抖动动画。
+**解锁弹窗**：标题"解锁《笔记名》"；provider 切换 tab（主密码 / 两步验证 / 恢复密钥）；底部固定小字警示；错误内联显示不弹窗；Enter 提交；失败抖动动画。**错误按 `UnlockFailureReason` 分原因给可执行的下一步**（`wrong-code` / `wrong-password` / `wrong-recovery` / `key-mismatch` / `combined-mismatch` / `incomplete` → i18n `unlock.*`），不再统一成"{方式}不正确，请重试"；空提交不计数、不消耗锁定次数；本机无种子时弹窗不关，原地显示恢复引导。
 
 **阅读态渲染**
 - 围栏 → 卡片：`🔒 已加密内容 · 点击解密`，解密后原地显示明文 + 右上"重新加密"。
 - 行内 → `🔒 密文` 药丸。
 - 未解锁时点解密 → 先弹解锁，成功后再执行原动作（有上下文，不用点两次）。
 
-**新建隐私笔记后的体验**：直接落在 `.sealed` 视图里、光标就位、标题可改（重命名文件）、`Ctrl+S` 或失焦 1.5s 自动保存（加密落盘）。首次保存前文件内容为空信封占位。
+**新建隐私笔记后的体验**：创建前先验证一次（内存里已有密钥则跳过），取消则不创建任何文件；创建后直接落在 `.sealed` 视图里、光标就位、标题可改（重命名文件）、`Ctrl+S` 或失焦 1.5s 自动保存（加密落盘）。没有"待加密"的中间态：payload 在创建瞬间就是真密钥封的空信封，写下的第一笔就是密文。
+
+**保存路径不再取凭据**：`flushNote` / `lockNote` 只使用已有会话的 DEK，缺密钥时仅记 warn 并返回，**绝不在后台弹密码框**；`scheduleFlush` 的"即将弹窗"延迟胶囊、`busyTimers`、`parkDraft` / `DraftStore` / `pendingEncrypt` 一并删除。1.5s 只是输入节流，不是加密等待，期间没有任何可见进度指示。
+
+**异常退出恢复**：`recoverAfterCrash` 只提示"有 N 篇正文仍是明文"，不再打 `pendingEncrypt` 标记；打开时统一验证，密文完整所以 `revealNote` 幂等、不动正文，之后一保存即重封。
 
 ---
 

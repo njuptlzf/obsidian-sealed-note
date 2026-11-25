@@ -213,8 +213,8 @@ UI 里我们统一说"重置"，不说"找回"。这不是文字游戏——说�
 └────────────┬─────────────┘  └────────────┬─────────────┘
              │                              │
              ▼                              ▼
-      xxx.sealed 文件              ```encrypted_txt``` 块
-      （整个文件是 JSON 信封）       `sn1.xxx` 行内密文
+      sealed-data/ID.sealedpayload   ```encrypted_txt``` 块
+      （原始 JSON 信封，笔记里只有占位+ID）  `sn1.xxx` 行内密文
              │
              │ 每个 .sealed 还内嵌：
              ▼
@@ -402,7 +402,16 @@ TOTP 有两个必须同时成立的条件：
 
 **TOTP 相关也在这里，但都是密文**：`slot.totp` 是用种子包裹的 DEK；`totp.seedRef` 是用设备密钥加密的种子。两者随笔记同步，但换设备后都解不开——所以换设备必须重新绑定。明文种子从不出现。
 
-### 6.2 笔记文件 `.sealed`
+### 6.2 笔记文件 `.sealed.md` 与 payload
+
+笔记本身是普通 Markdown，只有占位文字和一个稳定 ID：
+
+```
+🔒 这是一篇隐私笔记，请用插件解锁查看。
+<!-- sealed-note:ref=b1f2c3d4-... -->
+```
+
+信封放在 `sealed-data/<ID>.sealedpayload`（原始 JSON，不是 Markdown，不会进搜索索引）：
 
 ```json
 {
@@ -410,9 +419,12 @@ TOTP 有两个必须同时成立的条件：
   "kid": "b1f2c3d4-…",
   "salt": "<16B Base64>",
   "iv": "<12B Base64>",
-  "data": "<密文‖tag>"
+  "data": "<密文‖tag>",
+  "keys": { ... }
 }
 ```
+
+旧版把信封写在笔记里的格式（HTML 注释或裸 JSON）仍然可读；保存时会自动迁移到 payload。
 
 - `kid` 用于识别属于哪个密钥库（明文，但也只是个 UUID）
 - **文件名是明文**——`2026-财务密码.sealed` 这个名字本身就是信息，敏感场景请用中性命名
@@ -568,7 +580,7 @@ sn1.<Base64( salt8 ‖ iv12 ‖ ciphertext ‖ tag16 )>
 
 | 泄露了 | 操作 | 旧凭据 | 手机扫码 | 前提 |
 |---|---|---|---|---|
-| 主密码 | `changePassword(dek, newPw)` 重包 password slot；组合模式同步重包 password-totp | 立即失效 | 不用 | 能解锁（记得密码或用恢复密钥进） |
+| 主密码 | 纯密码模式：`changePassword(dek, newPw)` 重包 password slot。组合模式：只重包 password-totp 组合槽（严格双因子，没有单独的 password slot），且需本机种子 | 立即失效 | 不用 | 能解锁；组合模式还需本机有种子，否则去「恢复本机种子缓存」导入后再改 |
 | 恢复密钥 | `replaceRecovery(dek, newRec)` 重包 recovery slot | 立即失效 | 不用 | **先确认新密钥已安全保存**，否则把自己锁外面 |
 | TOTP 种子 | `configureMode(dek, mode, { seed: 新种子 })` 重包 TOTP slot | 立即失效 | **要，新种子必须重新扫码** | 能解锁进设置 |
 
@@ -633,7 +645,8 @@ sn1.<Base64( salt8 ‖ iv12 ‖ ciphertext ‖ tag16 )>
       │
       ├─ PBKDF2(新密码, 新盐, 600k) → 新 KEK（只跑这一次）
       │
-      ├─ AES-GCM(新KEK, DEK) → 新的 password slot 包裹
+      ├─ AES-GCM(新KEK, DEK) → 新的 slot 包裹
+      │    （纯密码模式 → password slot；组合模式 → password-totp 组合槽）
       │
       ▼
 扫描 vault 里所有 .sealed.md
@@ -676,7 +689,7 @@ sn1.<Base64( salt8 ‖ iv12 ‖ ciphertext ‖ tag16 )>
 | 威胁 | 说明 |
 |---|---|
 | **解锁状态下的内存读取** | 明文在内存和渲染层。恶意插件、调试器、内存转储都能拿到 |
-| **截屏 / 录屏 / 剪贴板** | 解密到剪贴板 = 所有程序都能读。我们提供"自动清空"但那是补救不是防护 |
+| **截屏 / 录屏 / 剪贴板** | 解密到剪贴板 = 所有程序都能读，且不自动清空（那是补救不是防护，也会误伤后续复制）。用完记得自己清 |
 | **文件名、大小、数量、修改时间** | 元数据是明文 |
 | **键盘记录器** | 密码在输入时就被截获 |
 | **被入侵的操作系统** | root 权限面前无解 |
