@@ -62,7 +62,7 @@ TOTP-only works from day one — no master password needed. The recovery key is 
 4. Edit it like any note — source mode, live preview, immersive mode, autocomplete and editor commands all work. `Ctrl+S` or ~1.5s of inactivity writes the ciphertext back to the payload. That 1.5s is just autosave throttling (matching Obsidian), not encryption wait time.
 5. **When it locks is decided by the lock policy** (table below). Every lock is the same sequence: encrypt the latest content back to the payload, restore the placeholder body, drop the key from memory.
 6. Opening a note never pops a dialog or steals any pane — the only automatic prompt is when creating a new note with no key in memory (and there's no file yet, so cancel creates nothing).
-7. Inline encrypted blocks in normal notes are unaffected by the padlock — you can edit the whole document without decrypting, and each block unlocks only when you click it.
+7. Inline encrypted blocks in normal notes are unaffected by the padlock — you can edit the whole document without decrypting. Plaintext blocks are sealed when you leave the note; sealed blocks unlock only when you click them. Both share the same lock-policy timing above.
 
 ### Lock policy (three tiers, strictest by default)
 
@@ -89,17 +89,18 @@ Settings → Sealed Note → **When an unlocked note re-locks**:
 
 ### Inline encrypted blocks
 
-In a normal note:
+Just type plaintext in a fenced block in a normal note:
 
 ````markdown
 ```encrypted_txt
-sn1.eyJ...
+my secret text
 ```
 ````
 
-- Editing state is ciphertext; the saved file is ciphertext too.
-- Reading state shows `🔒 Encrypted content`; click to decrypt (on screen only, file untouched).
-- Aliases: `txt_encrypted`, `sealed`.
+- **Sealed automatically when you leave** (switch note/tab, window blur, open settings, switch to reading view, or close the tab) — the same timing as a private note's lock policy. Once unlocked in this session, sealing is silent; the block is rewritten to `sn1.…` ciphertext in place. If the key is gone, you are asked once.
+- **Nothing is deleted on cancel.** The block stays plaintext, the status bar keeps a `⚠` warning, and the next visit asks again. Obsidian cannot veto a view switch, so the warning is the honest fallback.
+- **Reading view** shows `🔓 Not encrypted yet` with an **Encrypt this block** button — click it to seal on demand. Already-sealed blocks show `🔒 Encrypted content`; click to decrypt (on screen only, file untouched).
+- Aliases: `txt_encrypted`, `sealed`. You can also select text → right-click → **Encrypt selection** to seal immediately without waiting for a leave point.
 
 ### Inline ciphertext
 

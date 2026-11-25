@@ -12,6 +12,7 @@ import type SealedNotePlugin from "../main";
 import { openInline } from "../core/format";
 import { describeError } from "../util/errors";
 import { log } from "../util/log";
+import { t } from "../i18n";
 
 const logInline = log.child("inline");
 
@@ -34,11 +35,35 @@ async function renderEncryptedBlock(
   const card = el.createDiv({ cls: "sealed-block" });
 
   if (!payload.startsWith("sn1.")) {
-    card.addClass("sealed-block-invalid");
-    card.createSpan({ text: "🔒 无法识别的加密块" });
-    card.createEl("div", {
-      text: "这个块不以 sn1. 开头，可能不是本插件生成的，或内容被截断了。",
-      cls: "sealed-hint",
+    // Not ciphertext yet: the user typed this block as plaintext. It is a
+    // pending seal, not an error. Offer the same unlock click model as the
+    // lock pill: click, authenticate, the block's plaintext is sealed into
+    // sn1.* ciphertext IN THE FILE. The bytes are only rewritten after the
+    // key is accepted; nothing is ever deleted here.
+    card.addClass("sealed-block-unsealed");
+    const btn = card.createEl("button", { cls: "sealed-block-lock" });
+    setIcon(btn, "lock-open");
+    btn.createSpan({ text: t("card.unsealedTitle") });
+    card.createEl("div", { text: t("card.unsealedHint"), cls: "sealed-hint" });
+    const seal = card.createEl("button", { text: t("card.unsealedSeal"), cls: "sealed-btn" });
+    seal.addEventListener("click", async () => {
+      seal.disabled = true;
+      try {
+        // Seal the file's plaintext blocks through the same path the leaving
+        // hooks use: read current bytes, encrypt each unsealed block, one
+        // self-write. Cancel/failure keeps every byte as-is. notify=false:
+        // this card reports the outcome, the trail stays as the reminder.
+        const sealed = await plugin.sealPlainNote(ctx.sourcePath, {
+          interactive: true,
+          notify: false,
+        });
+        if (sealed < 0) new Notice(t("notice.sealCancelledCard"), 6000);
+        else if (sealed > 0) new Notice(t("notice.blocksSealed", { n: sealed }), 5000);
+        // sealed === 0: a concurrent seal already fixed the file; nothing to
+        // announce, the re-rendered card already shows the sealed state.
+      } finally {
+        seal.disabled = false;
+      }
     });
     return;
   }

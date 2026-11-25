@@ -39,7 +39,7 @@ import { createKeyring, createKeyringWithoutPassword, keyFingerprint, newVaultId
 import { generateTotpSecret, totpUri, formatSecret } from "./core/totp";
 import { describeError, Err } from "./util/errors";
 import { log, setLogLevel } from "./util/log";
-import { openInline, parseNoteRef, serializeNoteRevealed } from "./core/format";
+import { findUnsealedBlocks, openInline, parseNoteRef, serializeNoteRevealed } from "./core/format";
 import { TotpSetupModal } from "./ui/totp-modal";
 import { CandidatePickerModal, SecretPromptModal } from "./ui/recovery-modals";
 import { UnlockModeModal, PasswordPromptModal } from "./ui/mode-modals";
@@ -100,6 +100,20 @@ export default class SealedNotePlugin extends Plugin {
   private readonly unlockedLeaves = new Map<string, WorkspaceLeaf>();
   /** per-note autosave timers */
   private readonly saveTimers = new Map<string, number>();
+  /**
+   * Plain notes containing unsealed plaintext fences (a hand-typed
+   * ```encrypted_txt block whose body is not sn1.*). The entry is the trail:
+   * status bar shows it, every leaving point (blur/close per the SAME
+   * lockPolicy as private notes) attempts the seal, and a cancelled dialog
+   * keeps the entry so the next visit nags again. Nothing is ever deleted.
+   */
+  private readonly unsealedNotes = new Set<string>();
+  /** trail paths whose Notice has already been shown (status bar keeps nagging) */
+  private readonly warnedUnsealed = new Set<string>();
+  /** path -> leaf showing it, for the "close" policy's tab-close sweep */
+  private readonly unsealedLeaves = new Map<string, WorkspaceLeaf>();
+  /** anti-reentrancy: the unlock dialog itself fires blur/leaf events */
+  private readonly sealingNotes = new Set<string>();
   /** top level progress pill; one at a time, whoever owns busyPath controls it */
   private readonly busy = new BusyOverlay();
   private busyPath: string | null = null;
@@ -197,9 +211,13 @@ export default class SealedNotePlugin extends Plugin {
         // and treating that body as a revealed note would seal the whole
         // note through the legacy-migration path - destroying the user's
         // file. Plain notes never go through flushNote, period.
-        if (this.notes.isSealedPath(file.path) && this.isUnlocked(file.path)) {
-          this.scheduleFlush(file.path);
+        if (this.notes.isSealedPath(file.path)) {
+          if (this.isUnlocked(file.path)) this.scheduleFlush(file.path);
+          return;
         }
+        // Plain note: keep the "has unsealed plaintext fence" trail fresh so
+        // leaving points know what to seal and the status bar can nag.
+        void this.guard(() => this.trackUnsealed(file.path));
       }),
     );
 
@@ -222,6 +240,12 @@ export default class SealedNotePlugin extends Plugin {
         const vaultId = this.vaultIdentifier;
         void this.notes.reSealNote(file, dek, vaultId, vaultId).catch(() => undefined);
       }
+    }
+    // Plain notes on the unsealed-block trail: seal silently on the way out,
+    // cached DEK only. A dialog during unload would strand the app. Whatever
+    // is left stays visible plaintext (status bar flagged it); never deleted.
+    for (const path of this.unsealedNotes) {
+      void this.sealPlainNote(path, { interactive: false }).catch(() => undefined);
     }
     this.sessions?.lockAll();
     this.log.info("unloaded", {});
@@ -690,6 +714,15 @@ export default class SealedNotePlugin extends Plugin {
     if (!this.statusBarEl) return;
     const count = this.unlockService.unlockedCount();
     this.statusBarEl.empty();
+    if (this.unsealedNotes.size > 0) {
+      // Warning trail: a plaintext ```encrypted_txt block exists somewhere
+      // and its seal was skipped, cancelled, or not attempted yet.
+      this.statusBarEl.setText(`⚠️ ${t("status.unsealed", { n: this.unsealedNotes.size })}`);
+      this.statusBarEl.setAttribute("aria-label", t("status.unsealedHint"));
+      this.statusBarEl.addClass("sealed-status-warn");
+      return;
+    }
+    this.statusBarEl.removeClass("sealed-status-warn");
     if (!this.vaultIdentifier || count === 0) {
       this.statusBarEl.setText(t("status.locked"));
       this.statusBarEl.setAttribute("aria-label", t("status.noneUnlocked2"));
@@ -706,14 +739,26 @@ export default class SealedNotePlugin extends Plugin {
     // (see sweepClosedNoteTabs). All tabs closed (null) counts as leaving too.
     this.registerEvent(
       this.app.workspace.on("file-open", (file: TFile | null) => {
-        if (this.lockPolicy() === "blur") {
-          for (const path of this.sessions.unlockedPaths()) {
-            if (file && path === file.path) continue;
-            void this.guard(() => this.lockNote(path));
+        // Seal and lock MUST run in ONE serialized guard: both are async, and
+        // two independent fire-and-forget guards race - the lock loop can drop
+        // the cached DEK before sealing ever reads it (the user would get a
+        // surprise password prompt at every tab switch).
+        void this.guard(async () => {
+          if (this.shouldSealOnLeave()) {
+            await this.sealLeftNotes(file?.path ?? null);
           }
-        }
+          if (this.lockPolicy() === "blur") {
+            for (const path of this.sessions.unlockedPaths()) {
+              if (file && path === file.path) continue;
+              await this.lockNote(path);
+            }
+          }
+        });
         if (!file) return;
-        if (!this.notes.isSealedPath(file.path)) return;
+        if (!this.notes.isSealedPath(file.path)) {
+          void this.guard(() => this.trackUnsealed(file.path));
+          return;
+        }
         // newSealedNote reveals the body itself; the create-triggered file-open
         // event must not force the padlock view and steal focus.
         if (file.path === this.creatingNotePath) return;
@@ -740,11 +785,23 @@ export default class SealedNotePlugin extends Plugin {
         // layout restore). Locking here would close the editor the instant it
         // opens; the file-open event owns the real transitions.
         if (!active) return;
-        if (this.lockPolicy() === "blur") {
-          for (const path of this.sessions.unlockedPaths()) {
-            if (path === active.path) continue;
-            void this.guard(() => this.lockNote(path));
+        // Same serialization as file-open: seal before the lock loop drops
+        // the cached DEK. (See the file-open hook for the race details.)
+        void this.guard(async () => {
+          if (this.shouldSealOnLeave()) {
+            await this.sealLeftNotes(active.path);
           }
+          if (this.lockPolicy() === "blur") {
+            for (const path of this.sessions.unlockedPaths()) {
+              if (path === active.path) continue;
+              await this.lockNote(path);
+            }
+          }
+        });
+        // Switched ONTO a plain note with a stale trail (sealed elsewhere or
+        // the file was fixed): recompute so the status bar stops nagging.
+        if (!this.notes.isSealedPath(active.path)) {
+          void this.guard(() => this.trackUnsealed(active.path));
         }
         // Switched ONTO a sealed note that is not unlocked: make sure its tab
         // shows the padlock, never the annotation or a stale plaintext.
@@ -754,6 +811,7 @@ export default class SealedNotePlugin extends Plugin {
           });
         }
         this.sweepClosedNoteTabs();
+        this.sweepUnsealedClosedTabs();
       }),
     );
 
@@ -765,6 +823,8 @@ export default class SealedNotePlugin extends Plugin {
     this.registerEvent(
       this.app.workspace.on("layout-change", () => {
         this.sweepClosedNoteTabs();
+        this.sweepUnsealedClosedTabs();
+        void this.guard(() => this.sealReadingView());
       }),
     );
 
@@ -774,6 +834,8 @@ export default class SealedNotePlugin extends Plugin {
     this.registerDomEvent(window, "blur", () => {
       if (this.lockPolicy() !== "blur") return;
       void this.guard(async () => {
+        // Seal blocks BEFORE locking: the seal runs on the cached DEK.
+        await this.sealLeftNotes(null);
         await this.lockAllNotes();
         this.refreshStatusBar();
         this.refreshActiveView();
@@ -802,6 +864,7 @@ export default class SealedNotePlugin extends Plugin {
       setting.open = (...args: unknown[]) => {
         if (this.lockPolicy() === "blur") {
           void this.guard(async () => {
+            await this.sealLeftNotes(null);
             await this.lockAllNotes();
             this.refreshStatusBar();
           });
@@ -1406,6 +1469,205 @@ export default class SealedNotePlugin extends Plugin {
     await leaf.openFile(file);
   }
 
+  /* ---------------- inline-block sealing ------------------------------- */
+
+  /**
+   * Recompute whether a PLAIN note holds unsealed plaintext fences (a
+   * hand-typed ```encrypted_txt whose body is not sn1.*). The result is the
+   * trail that drives the status bar and the leaving-point seal attempts.
+   */
+  private async trackUnsealed(path: string): Promise<void> {
+    if (this.notes.isSealedPath(path)) return;
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) {
+      if (this.unsealedNotes.delete(path)) this.refreshStatusBar();
+      return;
+    }
+    const raw = await this.app.vault.cachedRead(file).catch(() => "");
+    const had = this.unsealedNotes.has(path);
+    const has = findUnsealedBlocks(raw).length > 0;
+    if (has) this.unsealedNotes.add(path);
+    else this.unsealedNotes.delete(path);
+    if (has !== had) {
+      if (has) this.rememberUnsealedLeaf(path);
+      else this.unsealedLeaves.delete(path);
+      this.refreshStatusBar();
+      // Deliberately NO seal here: modify fires while the user is still
+      // typing in the block. Sealing on a keystroke would rewrite the
+      // buffer mid-sentence and destroy the draft. Every seal happens at
+      // leaving points (blur, switch, reading-view render, tab close,
+      // unload) or on the user's own click in the rendered card.
+    }
+  }
+
+  /**
+   * A DEK usable for sealing without asking. One vault key wraps everything,
+   * so ANY live session holds it. Its lifetime already follows lockPolicy
+   * (blur drops sessions on leaving, close/session keep them).
+   */
+  private cachedSealDek(path: string): Uint8Array | null {
+    const own = this.sessions.get(path)?.dek ?? null;
+    if (own) return own;
+    for (const open of this.sessions.unlockedPaths()) {
+      const entry = this.sessions.get(open);
+      if (entry) return entry.dek;
+    }
+    return null;
+  }
+
+  /**
+   * Seal every unsealed plaintext fence in a plain note, in place.
+   *
+   * interactive=true: user-driven (blur point, card button) - may ask for the
+   * credential once. On cancel or failure NOTHING is deleted: the block stays
+   * plaintext, the trail keeps the status bar warning, and the next visit
+   * asks again (Obsidian cannot block the view switch itself).
+   * interactive=false: silent opportunistic seal (unload), cached key only,
+   * never a dialog.
+   * notify=false: the CALLER reports the outcome (the reading-view card shows
+   * its own notice); background hooks announce the lingering plaintext once.
+   */
+  async sealPlainNote(
+    path: string,
+    opts: { interactive: boolean; notify?: boolean } = { interactive: true },
+  ): Promise<number> {
+    if (this.sealingNotes.has(path)) return 0;
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile) || this.notes.isSealedPath(path)) return 0;
+    const raw = await this.app.vault.read(file).catch(() => "");
+    if (findUnsealedBlocks(raw).length === 0) {
+      if (this.unsealedNotes.delete(path)) {
+        this.warnedUnsealed.delete(path);
+        this.refreshStatusBar();
+      }
+      return 0; // nothing to seal counts as success upstream; 0 = "sealed nothing"
+    }
+    this.sealingNotes.add(path);
+    try {
+      let dek = this.cachedSealDek(path);
+      if (!dek) {
+        if (!opts.interactive) return -1; // silent pass: no key, no seal, no noise
+        this.claimBusy(path, t("busy.sealing"));
+        try {
+          dek = await this.unlockService.dekFor(path, { subject: file.basename, verb: "encrypt" });
+        } finally {
+          this.releaseBusy(path);
+        }
+      }
+      if (!dek) {
+        // user cancelled: plaintext stays, trail stays, nothing deleted
+        if (opts.notify !== false) this.warnUnsealed(path, null);
+        return -1;
+      }
+      const kr = await this.unlockService.requireKeyring();
+      this.vaultIdentifier = kr.vaultId;
+      const { text, sealed } = await this.encryption.sealUnsealedBlocks(dek, raw);
+      if (sealed > 0) {
+        await this.markSelfWrite(path, () => this.app.vault.modify(file, text));
+      }
+      this.unsealedNotes.delete(path);
+      this.unsealedLeaves.delete(path);
+      this.warnedUnsealed.delete(path);
+      this.refreshStatusBar();
+      if (sealed > 0) this.log.info("plain_note_sealed", { path, sealed });
+      return sealed;
+    } catch (error) {
+      // Honest failure: keep the bytes, leave the trail, explain once.
+      this.log.warn("block_seal_failed", { path, error: String(error) });
+      if (opts.notify !== false) this.warnUnsealed(path, describeError(error));
+      return -1;
+    } finally {
+      this.sealingNotes.delete(path);
+    }
+  }
+
+  /** Warning trail: block stays plaintext, status bar nags, notice explains. */
+  private warnUnsealed(path: string, reason: string | null, forceNotice = false): void {
+    const isNew = !this.unsealedNotes.has(path);
+    this.unsealedNotes.add(path);
+    if (isNew) this.rememberUnsealedLeaf(path);
+    this.refreshStatusBar();
+    // Background hooks (blur loops) may fire many times; one Notice per trail
+    // entry keeps the warning loud but not spammy. Explicit user clicks pass
+    // forceNotice=true and always hear back.
+    if (forceNotice || !this.warnedUnsealed.has(path)) {
+      this.warnedUnsealed.add(path);
+      new Notice(t("notice.unsealedKept", { name: path.split("/").pop() ?? path, reason: reason ?? "" }), 8000);
+    }
+  }
+
+  /**
+   * Seal the notes the user has LEFT (blur-level hooks). Runs BEFORE the
+   * session lock loop: sealing needs the cached DEK that locking drops.
+   */
+  private async sealLeftNotes(exceptPath: string | null): Promise<void> {
+    for (const path of [...this.unsealedNotes]) {
+      if (exceptPath && path === exceptPath) continue;
+      await this.sealPlainNote(path, { interactive: true });
+    }
+  }
+
+  /** Which event re-locks/asks about an unlocked NOTE also governs blocks. */
+  private shouldSealOnLeave(): boolean {
+    return this.lockPolicy() === "blur";
+  }
+
+  private rememberUnsealedLeaf(path: string): void {
+    const leaves: WorkspaceLeaf[] = [
+      ...(this.app.workspace.getLeavesOfType?.("markdown") ?? []),
+    ];
+    for (const leaf of leaves) {
+      if ((leaf.view as any)?.file?.path === path) {
+        this.unsealedLeaves.set(path, leaf);
+        return;
+      }
+    }
+    this.unsealedLeaves.delete(path);
+  }
+
+  /**
+   * Close-level sweep: a trail note whose tabs are ALL destroyed gets one
+   * seal attempt (interactive, same as a private note locking on close).
+   */
+  private sweepUnsealedClosedTabs(): void {
+    if (this.lockPolicy() !== "close") return;
+    for (const path of [...this.unsealedNotes]) {
+      if (this.anyLeafShows(path)) continue; // still open somewhere: not left yet
+      const leaf = this.unsealedLeaves.get(path);
+      if (!leaf) continue; // no reliable leaf: leaving hooks / card still cover it
+      if (this.leafAlive(leaf)) continue; // switched away, not closed
+      this.unsealedLeaves.delete(path);
+      void this.guard(async () => {
+        await this.sealPlainNote(path, { interactive: true });
+      });
+    }
+  }
+
+  /**
+   * Reading-view sweep. Toggling a note to reading view fires layout-change;
+   * an editor-mode toggle to PREVIEW also renders our card, but that is a
+   * live-preview render, not "left". For every trail note that is now shown
+   * ONLY in reading mode, attempt a seal. This is the user's requested
+   * "switch to reading view must not silently leave plaintext".
+   */
+  private async sealReadingView(): Promise<void> {
+    if (this.lockPolicy() !== "blur") return;
+    for (const path of [...this.unsealedNotes]) {
+      let inEditor = false;
+      let inReading = false;
+      this.app.workspace.iterateAllLeaves?.((leaf: WorkspaceLeaf) => {
+        const view = leaf.view as any;
+        if (view?.getViewType?.() !== "markdown") return;
+        if (view?.file?.path !== path) return;
+        if (typeof view.getMode === "function" && view.getMode() === "reading") inReading = true;
+        else inEditor = true;
+      });
+      if (inReading && !inEditor) {
+        await this.sealPlainNote(path, { interactive: true });
+      }
+    }
+  }
+
   /* ---------------- selection actions ---------------- */
 
   private selectionHasEncrypted(selection: string): boolean {
@@ -1458,6 +1720,15 @@ export default class SealedNotePlugin extends Plugin {
     }
     editor.replaceSelection(plain);
     new Notice(t("notice.decrypted"), 6000);
+    // A decrypted FENCE leaves plaintext inside an encrypted_txt block. The
+    // buffer may not have reached cachedRead yet, so register the trail
+    // directly instead of re-scanning - honest and race-free. (An inline
+    // `sn1.x` payload becomes bare text, not a tracked block.)
+    if (fenced) {
+      this.unsealedNotes.add(file.path);
+      this.rememberUnsealedLeaf(file.path);
+      this.refreshStatusBar();
+    }
     this.log.info("selection_decrypted", { path: file.path });
   }
 
@@ -1604,7 +1875,20 @@ export default class SealedNotePlugin extends Plugin {
     if (/(\.tmp|\.old)$/i.test(file.path) || /(\.tmp|\.old)$/i.test(oldPath)) return;
 
     const wasSealed = this.notes.isSealedPath(oldPath);
-    if (!wasSealed) return; // not a private note before the rename
+    if (!wasSealed) {
+      // A plain note: the only state we keep for it is the unsealed-block
+      // trail, which must follow the rename or the warning points at a dead
+      // path while the new one goes unsealed.
+      if (this.unsealedNotes.has(oldPath)) {
+        this.unsealedNotes.delete(oldPath);
+        this.unsealedNotes.add(file.path);
+        const leaf = this.unsealedLeaves.get(oldPath);
+        this.unsealedLeaves.delete(oldPath);
+        if (leaf) this.unsealedLeaves.set(file.path, leaf);
+        this.refreshStatusBar();
+      }
+      return; // not a private note before the rename
+    }
 
     // The canonical path always ends in .sealed.md. Strip any .sealed[.md]
     // the user left on, then re-add the canonical suffix.
@@ -1634,7 +1918,15 @@ export default class SealedNotePlugin extends Plugin {
   /** Delete the payload when its note goes away (default on). */
   private async onNoteDeleted(file: TAbstractFile): Promise<void> {
     if (!file || typeof file.path !== "string") return;
-    if (!this.notes.isSealedPath(file.path)) return;
+    if (!this.notes.isSealedPath(file.path)) {
+      // Plain note gone: its trail entry would nag for a file that no longer
+      // exists. Drop it.
+      if (this.unsealedNotes.delete(file.path)) {
+        this.unsealedLeaves.delete(file.path);
+        this.refreshStatusBar();
+      }
+      return;
+    }
     // Drop any in-memory state for the vanished note.
     const timer = this.saveTimers.get(file.path);
     if (timer) window.clearTimeout(timer);

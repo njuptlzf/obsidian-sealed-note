@@ -247,6 +247,20 @@
   font-size: 0.9em;
 }
 
+.sealed-status-warn {
+  color: var(--text-warning, #d9a441);
+  font-weight: 600;
+}
+
+.sealed-block-unsealed {
+  border-color: var(--text-warning, #d9a441);
+  background: var(--background-modifier-hover);
+}
+
+.sealed-block-unsealed .sealed-btn {
+  margin-top: 0.35rem;
+}
+
 .sealed-block-invalid {
   border-color: var(--text-error, #e5484d);
 }

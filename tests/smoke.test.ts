@@ -2409,3 +2409,128 @@ test("old combined vaults can close the password-only door", async () => {
   await assert.doesNotReject(() => plugin.unlockService.hardenCombinedMode());
   plugin.onunload();
 });
+
+/* ------------------------------------------------------------------ */
+/* Inline plaintext blocks (issue 1): typed as plaintext, sealed on     */
+/* leaving points, same lockPolicy as private notes. Cancel + failure  */
+/* keep the bytes; only a successful seal rewrites the file.           */
+/* ------------------------------------------------------------------ */
+
+/** Plain note keyed trail needs a real keyring; return its DEK. */
+async function seedInlineKey(plugin: any): Promise<Uint8Array> {
+  const { createKeyring } = await import("../src/core/keyring");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+  const vaultId = "c1000000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/inline-anchor", "anchor");
+  plugin.vaultIdentifier = vaultId;
+  return dek;
+}
+
+test("modify registers a hand-typed plaintext block as a warning trail", async () => {
+  const { plugin, harness } = await boot();
+  await seedInlineKey(plugin);
+  const { TFile } = await import("./obsidian-stub");
+  const path = "Plain/inline.md";
+  harness.files.set(path, "```encrypted_txt\ntest\n```\n");
+
+  const modify = harness.registered.events.find((e) => e.name === "vault:modify")!;
+  await modify.fn(new TFile(path));
+  // The handler fires guard() fire-and-forget: poll for the trail instead of
+  // trusting a single microtask (pitfall #7 in the API guide).
+  for (let i = 0; i < 50 && !(plugin as any).unsealedNotes.has(path); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  assert.equal((plugin as any).unsealedNotes.has(path), true, "trail registered");
+  assert.match(String(harness.registered.statusBar[0].text), /未加密|Unsealed/i, "status bar warns");
+  plugin.onunload();
+});
+
+test("sealPlainNote rewrites the fenced block into sn1 ciphertext in place", async () => {
+  const { plugin, harness } = await boot();
+  const dek = await seedInlineKey(plugin);
+  const path = "Plain/seal.md";
+  const src = "# note\n\n```encrypted_txt\nmy secret text\n```\nafter\n";
+  harness.files.set(path, src);
+
+  // A live session holds the vault DEK: no dialog, silent seal.
+  plugin.sessions.put(path, dek, "password");
+  const sealed = await plugin.sealPlainNote(path, { interactive: true, notify: false });
+
+  assert.ok(sealed > 0, "at least one block sealed");
+  const out = harness.files.get(path)!;
+  assert.ok(out.includes("```encrypted_txt\nsn1."), "fence kept, body is ciphertext");
+  assert.ok(!out.includes("my secret text"), "no plaintext left on disk");
+  assert.ok(out.startsWith("# note\n") && out.endsWith("after\n"), "surrounding text intact");
+  assert.equal((plugin as any).unsealedNotes.has(path), false, "trail cleared after seal");
+
+  // The ciphertext really decrypts back with the same key.
+  const { openInline } = await import("../src/core/format");
+  const payload = /```encrypted_txt\n(sn1\.[A-Za-z0-9+/=]+)\n```/.exec(out)![1];
+  assert.equal(await openInline(dek, plugin.vaultIdentifier, payload), "my secret text");
+  plugin.onunload();
+});
+
+test("cancel leaves the plaintext byte-for-byte and keeps the trail", async () => {
+  const { plugin, harness } = await boot();
+  await seedInlineKey(plugin);
+  const path = "Plain/cancel.md";
+  const src = "```encrypted_txt\nstill mine\n```\n";
+  harness.files.set(path, src);
+  // No cached DEK, and the unlock dialog returns "cancelled".
+  plugin.unlockService.dekFor = async () => null;
+
+  const sealed = await plugin.sealPlainNote(path, { interactive: true });
+
+  assert.equal(sealed, -1, "seal reports failure");
+  assert.equal(harness.files.get(path), src, "plaintext untouched, nothing deleted");
+  assert.equal((plugin as any).unsealedNotes.has(path), true, "trail stays for next visit");
+  assert.ok(harness.notices.some((n) => n.includes("未加密") || /plain/i.test(n)), "user was warned");
+  plugin.onunload();
+});
+
+test("leaving a note at blur policy seals its plaintext blocks", async () => {
+  const { plugin, harness } = await boot();
+  const dek = await seedInlineKey(plugin);
+  const path = "Plain/leave.md";
+  harness.files.set(path, "```encrypted_txt\nblur secret\n```\n");
+  const { TFile } = await import("./obsidian-stub");
+  const modify = harness.registered.events.find((e) => e.name === "vault:modify")!;
+  await modify.fn(new TFile(path));
+  for (let i = 0; i < 50 && !(plugin as any).unsealedNotes.has(path); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal((plugin as any).unsealedNotes.has(path), true);
+  plugin.sessions.put(path, dek, "password"); // already unlocked this session
+
+  // Switching to another note is a file-open leave point (blur policy).
+  harness.files.set("Plain/other.md", "");
+  harness.app.workspace.triggerFileOpen("Plain/other.md");
+  for (let i = 0; i < 50 && (plugin as any).unsealedNotes.has(path); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const out = harness.files.get(path)!;
+  assert.ok(out.includes("sn1."), "block sealed at the leave point");
+  assert.ok(!out.includes("blur secret"), "no plaintext survives");
+  plugin.onunload();
+});
+
+test("silent seal (unload) never opens a dialog without a cached key", async () => {
+  const { plugin, harness } = await boot();
+  await seedInlineKey(plugin);
+  const path = "Plain/unload.md";
+  const src = "```encrypted_txt\nkeep until asked\n```\n";
+  harness.files.set(path, src);
+  (plugin as any).unsealedNotes.add(path);
+  let prompted = 0;
+  plugin.unlockService.dekFor = async () => { prompted++; return null; };
+
+  await plugin.sealPlainNote(path, { interactive: false });
+
+  assert.equal(prompted, 0, "no modal on the opportunistic path");
+  assert.equal(harness.files.get(path), src, "bytes untouched without a key");
+  plugin.onunload();
+});
