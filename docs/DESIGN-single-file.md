@@ -81,26 +81,32 @@
         +-- 加密写回信封 <------------------------------+
 ```
 
-### 4.1 原子写与备份的不对称（关键安全点）
+### 4.1 正文写入用 vault.modify，不用适配器 swap（关键修正）
 
-现有 `writeAndSwap`（`sealed-note-store.ts:452-478`）每次写入前调 `backupBeforeOverwrite`（`505-518`），把**写入前的字节**备份到插件私有目录。方案 B 下这会造成明文泄漏：
+v1 的双文件架构里，payload 不是编辑器打开的文件，所以用 `writeAndSwap`（`sealed-note-store.ts:452-478`）做适配器级原子替换；正文用 `vault.modify` 保持编辑器同步。v2 里正文**同时是密文容器和编辑器内容**，适配器级 swap 会让编辑器 buffer 与磁盘脱节（用户继续打字会把旧 buffer 刷回去覆盖密文）。所以：
+
+- **正文写入一律用 `app.vault.modify(file, content)`**，让 Obsidian 自己同步编辑器；
+- `writeAndSwap` 的随机 token 与串行写链保留给仍需适配器写的场景（旧 payload 迁移读取、备份文件），不用于正文；
+- 失败恢复靠"密文信封有完整校验 + 重复写幂等"，而不是临时文件换位。
+
+这个取舍放弃了正文写入的严格原子性，换取编辑器一致性；profile §7 的临时名事故不会在这条路径上复现，因为这条路径根本不产生临时文件。
+
+### 4.1b 备份绝不落明文
+
+现有 `backupBeforeOverwrite`（`sealed-note-store.ts:505-518`）把**写入前的字节**备份到插件私有目录。v2 下：
 
 - 解锁时写明文：写入前是密文 → 备份密文，**安全**；
 - 锁定时写信封：写入前是明文 → 备份明文，**不安全**。
 
-因此 `atomicWrite` 需要增加 `backup: boolean` 参数：只有写入密文（reveal 那一步）才允许备份，写入明文后的一切写操作禁止备份。备份目录还要加一道校验：落盘前确认内容 `parseNoteEnvelope(text) !== null`，非信封一律不备份。
+因此备份函数加一道判定：`noteBodyState(current) !== "sealed"` 就直接跳过，只有当前字节是密文信封才备份。明文永远不会出现在备份目录。
 
-随机 token 临时名和 per-path 串行写链必须保留，这是 profile §7 两条真实事故（`Destination file already exists!`、固定临时名残留）的修复。
+### 4.1c 自动保存语义变更
 
-### 4.2 崩溃恢复
+v1 的 `flushNote`（`main.ts:1249-1277`）在解锁态把明文加密写进 payload，正文保持明文。v2 没有第二个位置可写：**解锁态磁盘正文就是明文，这是用户已确认接受的应用层边界**。因此 `flushNote` 退化为无操作（保留函数签名与调用链，避免动生命周期钩子），唯一真正写密文的时刻是锁定（`reSealNote`）。这也消除了 autosave 与锁定时写同一文件的竞态。
 
-崩溃只会发生在解锁态（正文是明文）。恢复路径：
+### 4.2 启动扫描：明文态提示
 
-1. 启动时扫描 `.sealed.md`，`noteBodyState` 判为 `revealed` 的记录到列表；
-2. 不自动改动，提示用户"N 篇笔记因异常退出仍是明文态"；
-3. 打开该笔记时走正常解锁流程：需要 key copy 验证密码。若 vault 里还有任意一篇锁定态笔记，keyring 可从其信封的 `keys` 重建（`note-keyring-store.ts:55-74` → `84-95`），密码解锁正常；
-4. 若所有笔记都处于解锁态（没有 key source），引导用户用恢复密钥重建 keyring（现有 `show-recovery-key` / `rebuild-keyring-from-note` 命令链），再把当前正文加密成信封；
-5. 恢复完成后正文变成密文，备份里的旧密文快照可按保留策略清理。
+启动时扫描 `.sealed.md`，`noteBodyState` 判为 `revealed` 的记录到列表并提示"N 篇笔记当前是明文态"。不自动写回（自动加密会在用户无密钥时失败或打断编辑）。下次锁定走正常 `reSealNote` 把它加密成信封即可。用户已明确接受解锁态明文落盘的边界。
 
 默认 `lockPolicy: blur` 保证离开笔记即锁，正常关闭时 `onunload` re-seal，因此"所有笔记都解锁"只在崩溃时可能出现，是可接受的边界。
 

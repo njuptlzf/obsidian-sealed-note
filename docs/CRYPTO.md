@@ -213,8 +213,8 @@ UI 里我们统一说"重置"，不说"找回"。这不是文字游戏——说�
 └────────────┬─────────────┘  └────────────┬─────────────┘
              │                              │
              ▼                              ▼
-      sealed-data/ID.sealedpayload   ```encrypted_txt``` 块
-      （原始 JSON 信封，笔记里只有占位+ID）  `sn1.xxx` 行内密文
+      xxx.sealed.md 正文（锁定态）  ```encrypted_txt``` 块
+      （HTML 注释包裹的 JSON 信封）    `sn1.xxx` 行内密文
              │
              │ 每个 .sealed 还内嵌：
              ▼
@@ -402,18 +402,12 @@ TOTP 有两个必须同时成立的条件：
 
 **TOTP 相关也在这里，但都是密文**：`slot.totp` 是用种子包裹的 DEK；`totp.seedRef` 是用设备密钥加密的种子。两者随笔记同步，但换设备后都解不开——所以换设备必须重新绑定。明文种子从不出现。
 
-### 6.2 笔记文件 `.sealed.md` 与 payload
+### 6.2 笔记文件 `.sealed.md`（单文件正文信封）
 
-笔记本身是普通 Markdown，只有占位文字和一个稳定 ID：
+一个 `.sealed.md` 文件就是整篇隐私笔记，没有独立密文目录、没有注释锚点。锁定态正文是 HTML 注释包裹的 JSON 信封（渲染视图下不可见）：
 
 ```
-🔒 这是一篇隐私笔记，请用插件解锁查看。
-<!-- sealed-note:ref=b1f2c3d4-... -->
-```
-
-信封放在 `sealed-data/<ID>.sealedpayload`（原始 JSON，不是 Markdown，不会进搜索索引）：
-
-```json
+<!-- sealed-note/note/1
 {
   "format": "sealed-note/note/1",
   "kid": "b1f2c3d4-…",
@@ -422,9 +416,10 @@ TOTP 有两个必须同时成立的条件：
   "data": "<密文‖tag>",
   "keys": { ... }
 }
+-->
 ```
 
-旧版把信封写在笔记里的格式（HTML 注释或裸 JSON）仍然可读；保存时会自动迁移到 payload。
+解锁后同一文件的正文被替换为**纯明文**（不带任何注释）；锁定时再换回信封。旧版 v1 格式（注释锚点 + `sealed-data/<ID>.sealedpayload`）仍可读，用命令面板的「转换为单文件格式」迁移，幂等且失败保留原样。
 
 - `kid` 用于识别属于哪个密钥库（明文，但也只是个 UUID）
 - **文件名是明文**——`2026-财务密码.sealed` 这个名字本身就是信息，敏感场景请用中性命名

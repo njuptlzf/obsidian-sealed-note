@@ -18,7 +18,7 @@ An Obsidian plugin that encrypts **only the notes and fragments you choose** —
 
 - **Only what you mark is encrypted** — full private notes (`.sealed.md`), inline blocks, and inline `sn1.…` fragments. The rest of the vault stays plain and searchable.
 - **Password can be reset, never recovered** — anyone claiming to recover your password either deceives you or kept a backdoor. Here the recovery key rewraps the same data key; note content is never re-encrypted.
-- **No keyring file** — the wrapped key lives in the `keys` field of every note's ciphertext payload, so it syncs with your notes and any one note can unlock the whole vault.
+- **No keyring file, no sidecar** — the wrapped key lives in the `keys` field of every locked note's own body, so it syncs with your notes and any one note can unlock the whole vault. There is no `sealed-data/` folder and no annotation to maintain.
 - **Native Markdown editing** — on unlock the plaintext is written **in place** into the note's own body: source mode, live preview, immersive mode and every editor command work as usual. There is never a second plaintext file on disk.
 - **Three unlock modes, switchable any time** — password only, TOTP only, or password + TOTP as strict two-factor (no password-only door exists in that mode). The recovery key is always the last-resort channel.
 - **Automatic locking** — a three-tier policy (blur / close note / per-session) decides when an unlocked note re-encrypts and drops its key, defaulting to the strictest: lock on any focus loss.
@@ -55,13 +55,12 @@ TOTP-only works from day one — no master password needed. The recovery key is 
 
 ### Private notes (whole-note encryption)
 
-1. Create a note via the ribbon icon or the command palette. The plugin appends `.sealed.md` for you. The key is verified **before** creating anything; if you cancel, no file is created. Disk gets `name.sealed.md` (placeholder note, body is only an invisible ID comment) plus `sealed-data/<ID>.sealedpayload` (real ciphertext from the instant of creation).
-   - **Renaming is safe** — the ID lives in the note body and the ciphertext is keyed by ID, so renaming never breaks decryption. If you accidentally drop the `.sealed.md` suffix, the plugin restores it.
-2. Writing is silent — the note is encrypted from its first character; `Ctrl+S` and autosave are millisecond disk writes, no dialogs or progress bars.
-3. Clicking back onto a private note shows **only a large padlock**; click "Unlock and edit" to prompt for your credential, then continue in the native editor.
-4. Edit it like any note — source mode, live preview, immersive mode, autocomplete and editor commands all work. `Ctrl+S` or ~1.5s of inactivity writes the ciphertext back to the payload. That 1.5s is just autosave throttling (matching Obsidian), not encryption wait time.
-5. **When it locks is decided by the lock policy** (table below). Every lock is the same sequence: encrypt the latest content back to the payload, restore the placeholder body, drop the key from memory.
-6. Opening a note never pops a dialog or steals any pane — the only automatic prompt is when creating a new note with no key in memory (and there's no file yet, so cancel creates nothing).
+1. Create a note via the ribbon icon or the command palette. The plugin appends `.sealed.md` for you. The key is verified **before** creating anything; if you cancel, no file is created. Disk gets exactly one file: `name.sealed.md`, whose body is the encrypted envelope from the first byte.
+   - **Renaming and moving are safe** — the ciphertext is inside the file itself, so nothing can be separated from it. If you accidentally drop the `.sealed.md` suffix, the plugin restores it.
+2. Clicking back onto a locked note shows **only a large padlock** — the file body is ciphertext. Click "Unlock and edit" to prompt for your credential.
+3. Unlock replaces the body with **bare plaintext**: no ID comment, no annotation, nothing to maintain. Source mode, live preview, immersive mode and every editor command work as usual.
+4. **When it locks is decided by the lock policy** (table below). Locking encrypts the latest content and replaces the very same body with the envelope, then drops the key from memory. Obsidian's own autosave handles the plaintext while you edit; there is no second file to sync.
+5. Opening a locked note never pops a dialog or steals any pane — it just shows the padlock, and the credential prompt happens only when you choose to unlock.
 7. Inline encrypted blocks in normal notes are unaffected by the padlock — you can edit the whole document without decrypting. Plaintext blocks are sealed when you leave the note; sealed blocks unlock only when you click them. Both share the same lock-policy timing above.
 
 ### Lock policy (three tiers, strictest by default)
@@ -77,15 +76,13 @@ Settings → Sealed Note → **When an unlocked note re-locks**:
 - "Switch window" means Obsidian loses focus (Alt+Tab, switching apps).
 - The cost of "don't lock when switching": at the middle tier, notes whose tab is still open keep plaintext in the `.sealed.md` body (indexed/synced) until you close that tab, lock manually, or quit Obsidian.
 
-> 🔒 **In-place editing, no plaintext copy.** On unlock the plaintext is written straight into `name.sealed.md`'s body; on lock it is re-encrypted to `sealed-data/` and the placeholder is restored. The old `sealed-note-work/` working-copy directory is gone and cleaned at startup — there is no "plaintext file anyone can open".
+> 🔒 **One file, no sidecar, no annotation.** A locked `.sealed.md` body is the encrypted envelope itself (an HTML comment wrapping JSON, invisible in reading view). Unlocking swaps it for bare plaintext; locking swaps it back. There is no `sealed-data/` directory, no `.sealedpayload` file, no `sealed-note:ref` comment, and nothing you must avoid deleting.
 >
-> ⚠️ **The one window:** while unlocked, plaintext lives in the `.sealed.md` body and is indexed and synced. This is the inherent cost of in-place editing, the trade-off behind "edit anywhere + lock on policy". Unlock only when editing; the configured policy (default: lock on focus loss) re-seals it for you. If Obsidian crashes while unlocked, the leftover plaintext body is **not silently wiped** at startup — you are prompted, verified once on open, and re-sealed with the real key on first save. Nothing is lost.
+> ⚠️ **The one window:** while unlocked, plaintext lives in the `.sealed.md` body and is indexed and synced. That is the honest boundary of application-layer in-place editing. Unlock only when editing; the configured policy (default: lock on focus loss) re-seals it for you. If Obsidian crashes while unlocked, the plaintext body is left untouched — nothing is silently wiped, and the next lock seals it with the real key.
 >
-> Sync `.sealed.md` **and** `sealed-data/` — do **not** exclude `sealed-data/`. The payload is `.sealedpayload` (not Markdown, so it never enters Obsidian's index/graph, but Remotely Save / Git still sync it).
->
-> **Why can't I see `sealed-data/` in Obsidian?** Obsidian's file tree only shows file types it knows; the custom `.sealedpayload` suffix is hidden — the files are on disk (open the folder in your OS file manager) and sync tools still upload them. To show them in the tree: **Settings → Files and links → "Detect all file extensions"**. This is an Obsidian display setting, unrelated to encryption or sync.
+> Sync `.sealed.md` as you would any note. One file is the whole note, so there is nothing extra to remember to sync. Old v1 vaults (annotation + `sealed-data/`) keep working read-only until you run **Convert notes to single-file format** from the command palette; the migration is idempotent and skips anything already converted.
 
-**Deleting a note** keeps its ciphertext by default, so sync conflicts or accidental deletes can't destroy it. You can opt into "delete ciphertext with the note" in settings. Orphaned payloads can be cleaned with the "Purge orphan payloads" button (or the same command from the palette).
+**Deleting a note** deletes its ciphertext with it, since they are the same file. Ordinary file backup / version history is the recovery path, exactly as for any other note.
 
 ### Inline encrypted blocks
 
@@ -114,7 +111,7 @@ Select text → right-click → **Encrypt selection** → becomes `` `sn1.xxx` `
 | Source-mode editor (any note) | Decrypt document / Encrypt selection / Decrypt selection / Decrypt selection to clipboard |
 | File tree → **folder** | New private note (created in that folder, like native "New note") |
 | File tree (private or plain note) | Decrypt document (private note makes a plaintext copy; plain note decrypts all blocks in place) |
-| File tree (private note) | Reclaim a deleted annotation (recovery key) / Unlock / Lock |
+| File tree (private note) | Unlock / Lock |
 | Reading-mode block / pill | Click → unlock dialog per configured method → show original |
 
 ---
@@ -207,15 +204,15 @@ A compatibility test runs the actual HTML to make sure it produces the same resu
 
 ### File names and indexing
 
-`.sealed.md` file names are plaintext and enter Obsidian's index, but the body is only an ID comment — **no plaintext or ciphertext**. The real ciphertext is in `sealed-data/*.sealedpayload` (not Markdown, so not in search/graph), yet Remotely Save / Git still sync it. Use neutral names in sensitive setups.
+`.sealed.md` file names are plaintext and enter Obsidian's index. A locked body is the encrypted envelope, wrapped in an HTML comment so reading view shows nothing; unlocked, the same body holds plaintext. Use neutral names in sensitive setups.
 
-### Recovering a deleted annotation
+### If a note gets damaged
 
-`<!-- sealed-note:ref=<ID> -->` is the only clue linking a note to its ciphertext; if it's deleted the plugin can't know which payload belongs to the note. Recovery, in recommended order:
+There is no annotation or sidecar to lose: the ciphertext is the note. Recovery is ordinary file recovery:
 
-1. **Version control (best):** Git or a history-capable sync tool restores the `.sealed.md` to before the deletion — lossless and automatic.
-2. **Recovery-key reclaim:** on the annotation-less private note, run "Reclaim a deleted annotation (recovery key)" from the palette or context menu → enter the recovery key → the plugin lists every payload it can open (with title and preview) → pick the one for this note → it writes the body back, creates a new annotation and a new payload. The original ciphertext is kept, nothing is deleted. Note: the recovery key opens payloads but **can't tell ownership** — you must pick.
-3. If the payload file is gone too (even `sealed-data/` was cleared), the recovery key is powerless — restore the files from history.
+1. **Version control (best):** Git or a history-capable sync tool restores the `.sealed.md` to a good version — lossless and automatic.
+2. **Recovery key:** if the envelope's key copy is intact but the credential is forgotten, use the recovery key through the normal unlock flow. If an external editor replaced the envelope with text, the plugin encrypts that text on next unlock and backs up the old bytes first.
+3. If the file itself is gone, only file history can bring it back — exactly like any other note.
 
 ---
 
