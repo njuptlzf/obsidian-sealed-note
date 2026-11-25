@@ -379,6 +379,18 @@ export function findFencedBlocks(source: string): FencedBlock[] {
   return out;
 }
 
+/**
+ * Fenced blocks whose body is still PLAINTEXT: non-empty and not an sn1
+ * payload. These are the blocks a user typed by hand (or a partially
+ * decrypted block) that must be sealed before the note leaves the editor.
+ * Empty blocks are not "unsealed" - there is nothing to encrypt yet.
+ */
+export function findUnsealedBlocks(source: string): FencedBlock[] {
+  return findFencedBlocks(source).filter(
+    (block) => block.payload !== "" && !block.payload.startsWith(`${INLINE_VERSION}.`),
+  );
+}
+
 /** `sn1:...` or `` `sn1:...` `` inline payloads. */
 export function findInlinePayloads(source: string): Array<{ start: number; end: number; payload: string }> {
   const out: Array<{ start: number; end: number; payload: string }> = [];

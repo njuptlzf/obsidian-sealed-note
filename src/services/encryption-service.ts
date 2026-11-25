@@ -8,6 +8,7 @@
 import {
   findFencedBlocks,
   findInlinePayloads,
+  findUnsealedBlocks,
   openInline,
   openNote,
   parseNoteEnvelope,
@@ -56,6 +57,32 @@ export class EncryptionService {
 
   async decryptInline(dek: Uint8Array, payload: string): Promise<string> {
     return openInline(dek, this.vaultId(), payload);
+  }
+
+  /**
+   * Seal every hand-typed plaintext fenced block in a document, in place.
+   *
+   * Back-to-front so earlier offsets stay valid while rewriting. The fence
+   * language is preserved per block; only the body changes. A failed seal
+   * leaves that block byte-for-byte untouched (and the error propagates to
+   * the caller, which decides between "still unlocked, retry silently" and
+   * "warn the user" - the text must never be destroyed).
+   */
+  async sealUnsealedBlocks(
+    dek: Uint8Array,
+    source: string,
+  ): Promise<{ text: string; sealed: number }> {
+    const blocks = findUnsealedBlocks(source);
+    if (blocks.length === 0) return { text: source, sealed: 0 };
+    let text = source;
+    for (const block of [...blocks].sort((a, b) => b.start - a.start)) {
+      const payload = await sealInline(dek, this.vaultId(), block.payload);
+      // block.start/end address `text` unchanged: we only rewrite from back
+      // to front, so every earlier region is still at its original offset.
+      text = text.slice(0, block.start) + wrapFenced(payload, block.lang) + text.slice(block.end);
+    }
+    this.log.info("blocks_sealed", { sealed: blocks.length });
+    return { text, sealed: blocks.length };
   }
 
   /**

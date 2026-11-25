@@ -56,6 +56,7 @@ function memEpochStore(): EpochStore {
 import {
   findFencedBlocks,
   findInlinePayloads,
+  findUnsealedBlocks,
   openInline,
   openNote,
   parseNoteEnvelope,
@@ -66,6 +67,7 @@ import {
 import { generateRecoveryKey, recoverySecret, assertRecoveryKey, groupRecovery } from "../src/core/recovery";
 import { totpCode, verifyTotp, generateTotpSecret } from "../src/core/totp";
 import { SessionStore } from "../src/core/session";
+import { EncryptionService } from "../src/services/encryption-service";
 
 // PBKDF2 at 600k is too slow for a unit test suite; the production default is
 // asserted separately. Everything else is the real deal.
@@ -383,6 +385,68 @@ test("inline: wrapFenced produces something the scanner reads back", () => {
   const found = findFencedBlocks("a\n" + wrapped + "\nb");
   assert.equal(found.length, 1);
   assert.equal(found[0].payload, "sn1.XXXX");
+});
+
+/* ------------------------------------------------------------------ */
+/* unsealed-block scanning + in-place sealing                          */
+/* ------------------------------------------------------------------ */
+
+test("unsealed: hand-typed plaintext fences are found, sealed and empty ones are not", async () => {
+  const dek = newDek();
+  const sealed = await sealInline(dek, VAULT, "already sealed");
+  const src = [
+    "```encrypted_txt",
+    sealed,
+    "```",
+    "",
+    "```encrypted_txt",
+    "test",
+    "```",
+    "",
+    "```sealed",
+    "```",
+  ].join("\n");
+  const unsealed = findUnsealedBlocks(src);
+  assert.equal(unsealed.length, 1, "only the plaintext body counts");
+  assert.equal(unsealed[0].payload, "test");
+});
+
+test("unsealed: empty and whitespace-only fences are not sealed targets", () => {
+  const src = "```encrypted_txt\n   \n```";
+  assert.equal(findUnsealedBlocks(src).length, 0);
+});
+
+test("sealUnsealedBlocks: round trips through decryptAll, language preserved", async () => {
+  const svc = new EncryptionService(() => VAULT);
+  const dek = newDek();
+  const src = [
+    "intro",
+    "```encrypted_txt",
+    "secret one",
+    "```",
+    "middle",
+    "```sealed",
+    "secret two",
+    "```",
+    "outro",
+  ].join("\n");
+
+  const { text, sealed } = await svc.sealUnsealedBlocks(dek, src);
+  assert.equal(sealed, 2);
+  assert.ok(!text.includes("secret one") && !text.includes("secret two"), "no plaintext left");
+  assert.ok(text.startsWith("intro\n```encrypted_txt\nsn1."), "first fence keeps its language");
+  assert.ok(text.includes("```sealed\nsn1."), "second fence keeps its language");
+  assert.ok(text.includes("middle") && text.endsWith("outro"), "surrounding text intact");
+
+  // and everything the scanner sealed, the decryptor opens back
+  const back = await svc.decryptAll(dek, text);
+  assert.equal(back.failed, 0);
+  assert.ok(back.text.includes("secret one") && back.text.includes("secret two"));
+
+  // no unsealed blocks -> identical text, zero count (idempotent fast path)
+  const again = await svc.sealUnsealedBlocks(dek, text);
+  assert.equal(again.sealed, 0);
+  assert.equal(again.text, text);
 });
 
 /* ------------------------------------------------------------------ */
