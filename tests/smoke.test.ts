@@ -376,6 +376,108 @@ test("orphan payload detection ignores payloads referenced by notes", async () =
   plugin.onunload();
 });
 
+/* ------------------------------------------------------------------ */
+/* DEK-cache sessions on PLAIN notes must never enter the note-seal    */
+/* machinery: with a keyring present, flushNote on a plain path reads  */
+/* an empty "revealed body", seals it through writePlaintext's legacy  */
+/* migration branch and REPLACES THE WHOLE FILE with a placeholder.   */
+/* ------------------------------------------------------------------ */
+
+/** Install a real keyring so requireKeyring() resolves; returns its DEK.
+ * This design has no keyring file: the wrapped key lives in a note payload's
+ * key copy, so we must create an actual private note as the key anchor.
+ * Without it requireKeyring throws before flushNote reaches the seal path and
+ * the test passes for the wrong reason (verified: the pre-fix run needs the
+ * anchor to actually reproduce the corruption). */
+async function seedKeyring(plugin: any): Promise<Uint8Array> {
+  const { createKeyring } = await import("../src/core/keyring");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+  const vaultId = "60000000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/anchor", "anchor");
+  plugin.vaultIdentifier = vaultId;
+  return dek;
+}
+
+/** Number of sealedpayload files currently in the fake vault. */
+function countPayloads(harness: any): number {
+  return [...harness.files.keys()].filter((p: string) => p.endsWith(".sealedpayload")).length;
+}
+
+test("modify on a plain note with a DEK-cache session does not seal it away", async () => {
+  const { plugin, harness } = await boot();
+  const dek = await seedKeyring(plugin);
+  const { TFile } = await import("./obsidian-stub");
+
+  const path = "Journal/plain.md";
+  const original = "meeting notes\n\n```encrypted_txt\nsn1.abc\n```\n";
+  harness.files.set(path, original);
+  plugin.settingsData.autoSaveMs = 10;
+  // A DEK cache exists because the user unlocked an inline block here.
+  plugin.sessions.put(path, dek, "password");
+  const payloadsBefore = countPayloads(harness);
+
+  const modify = harness.registered.events.find((e) => e.name === "vault:modify");
+  assert.ok(modify, "modify hook registered");
+  await modify!.fn(new TFile(path));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  assert.equal(harness.files.get(path), original, "plain note body untouched");
+  assert.equal(countPayloads(harness), payloadsBefore, "no payload minted from the plain note");
+  assert.ok(plugin.sessions.has(path), "the DEK cache itself is not dropped by autosave");
+  plugin.onunload();
+});
+
+test("flushNote refuses a plain path outright", async () => {
+  const { plugin, harness } = await boot();
+  const dek = await seedKeyring(plugin);
+
+  const path = "Journal/flush-direct.md";
+  harness.files.set(path, "do not seal me\n");
+  plugin.sessions.put(path, dek, "password");
+  const payloadsBefore = countPayloads(harness);
+
+  await plugin.flushNote(path);
+
+  assert.equal(harness.files.get(path), "do not seal me\n", "body survives a direct flush call");
+  assert.equal(countPayloads(harness), payloadsBefore, "no payload minted");
+  plugin.onunload();
+});
+
+test("lockNote on a plain path drops only the DEK cache", async () => {
+  const { plugin, harness } = await boot();
+  const dek = await seedKeyring(plugin);
+
+  const path = "Journal/plain2.md";
+  harness.files.set(path, "body stays plaintext\n");
+  plugin.sessions.put(path, dek, "password");
+  const payloadsBefore = countPayloads(harness);
+
+  await plugin.lockNote(path); // must not throw "无法读取笔记 ID"
+
+  assert.equal(plugin.sessions.has(path), false, "cache dropped");
+  assert.equal(harness.files.get(path), "body stays plaintext\n", "file intact");
+  assert.equal(countPayloads(harness), payloadsBefore, "no payload minted by locking");
+  plugin.onunload();
+});
+
+test("onunload with a plain-note cache neither seals it nor throws", async () => {
+  const { plugin, harness } = await boot();
+  const dek = await seedKeyring(plugin);
+
+  const path = "Journal/plain3.md";
+  harness.files.set(path, "# still mine\n");
+  plugin.sessions.put(path, dek, "password");
+  const payloadsBefore = countPayloads(harness);
+
+  plugin.onunload();
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(harness.files.get(path), "# still mine\n", "no legacy migration on unload");
+  assert.equal(countPayloads(harness), payloadsBefore, "no orphan payload minted");
+});
+
 test("unlocking reveals plaintext in the note body and switches to the Markdown view", async () => {
   const { plugin, harness } = await boot();
   const { createKeyring } = await import("../src/core/keyring");

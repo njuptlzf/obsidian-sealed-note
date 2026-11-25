@@ -192,7 +192,14 @@ export default class SealedNotePlugin extends Plugin {
       this.app.vault.on("modify", (file: TAbstractFile) => {
         if (!(file instanceof TFile)) return;
         if (this.selfWrites.has(file.path)) return; // our own re-seal write
-        if (this.isUnlocked(file.path)) this.scheduleFlush(file.path);
+        // Only private notes have a plaintext body to flush into a payload.
+        // A plain note may hold a DEK *cache* session (inline-block unlock),
+        // and treating that body as a revealed note would seal the whole
+        // note through the legacy-migration path - destroying the user's
+        // file. Plain notes never go through flushNote, period.
+        if (this.notes.isSealedPath(file.path) && this.isUnlocked(file.path)) {
+          this.scheduleFlush(file.path);
+        }
       }),
     );
 
@@ -204,7 +211,11 @@ export default class SealedNotePlugin extends Plugin {
     // Best-effort: flush every unlocked note back into its payload so no
     // plaintext body survives in the file. Without a DEK we must NOT encrypt
     // (that would corrupt the payload) - the boot scan handles those notes.
+    // Non-sealed paths in the session map are only DEK caches for inline
+    // blocks - they hold no plaintext body and must never go through the
+    // document re-seal (that would overwrite a normal note with a placeholder).
     for (const path of this.sessions.unlockedPaths()) {
+      if (!this.notes.isSealedPath(path)) continue;
       const dek = this.sessions.get(path)?.dek ?? null;
       const file = this.app.vault.getAbstractFileByPath(path);
       if (dek && file instanceof TFile) {
@@ -1140,6 +1151,17 @@ export default class SealedNotePlugin extends Plugin {
       return; // already locked
     }
 
+    // A plain note can hold a session entry only as a DEK cache (inline block
+    // unlock). Its body is NOT revealed note plaintext: running it through
+    // reSealNote hits the legacy-migration path and replaces the whole file
+    // with a placeholder comment. Drop the cache, touch nothing on disk.
+    if (!this.notes.isSealedPath(notePath)) {
+      this.sessions.lock(notePath);
+      this.refreshStatusBar();
+      this.log.info("dek_cache_dropped", { note: notePath });
+      return;
+    }
+
     const dek = this.sessions.get(notePath)?.dek ?? null;
     try {
       if (!dek) {
@@ -1164,6 +1186,9 @@ export default class SealedNotePlugin extends Plugin {
   /** Flush the revealed body into the payload WITHOUT locking (autosave). */
   async flushNote(notePath: string): Promise<void> {
     if (this.savingNotes.has(notePath)) return;
+    // Defence in depth (see lockNote): only a private note has a revealed
+    // plaintext body. A plain note's session is a DEK cache, never flushable.
+    if (!this.notes.isSealedPath(notePath)) return;
     const file = this.app.vault.getAbstractFileByPath(notePath);
     if (!(file instanceof TFile)) return;
     if (!this.isUnlocked(notePath)) return;
