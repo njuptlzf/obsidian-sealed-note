@@ -15,6 +15,7 @@
 import {
   KeyringData,
   UnlockError,
+  UnlockFailureReason,
   SLOT_PASSWORD,
   SLOT_RECOVERY,
   SLOT_TOTP,
@@ -23,6 +24,29 @@ import {
   unlockFromCredential,
 } from "./keyring";
 import { verifyTotp } from "./totp";
+
+/**
+ * Try a credential against the keyring, translating the generic "no slot
+ * accepts this" into what the failure actually means FOR THIS METHOD.
+ *
+ * `unlockFromCredential` cannot know: the same rejection is a wrong password in
+ * password mode, a seed that differs from the one the keyring was built with in
+ * TOTP mode, and a recovery key from another vault in recovery mode. Phrasing
+ * all three as "incorrect, try again" is what made a user with a correct code
+ * keep retyping it.
+ */
+async function openWith(
+  kr: KeyringData,
+  credential: string,
+  reason: UnlockFailureReason,
+): Promise<Uint8Array> {
+  try {
+    return await unlockFromCredential(kr, credential);
+  } catch (error) {
+    if (error instanceof UnlockError) throw new UnlockError("Credential rejected", true, reason);
+    throw error;
+  }
+}
 
 export type ProviderId = "password" | "totp" | "password+totp" | "recovery";
 
@@ -72,10 +96,10 @@ export class PasswordProvider implements UnlockProvider {
     return !!kr.slots[SLOT_PASSWORD];
   }
 
-  async unlock(kr: KeyringData, attempt: UnlockAttempt): Promise<Uint8Array> {
-    if (!attempt.secret) throw new UnlockError("请输入主密码");
-    return unlockFromCredential(kr, credentialFor(SLOT_PASSWORD, { password: attempt.secret }));
-  }
+    async unlock(kr: KeyringData, attempt: UnlockAttempt): Promise<Uint8Array> {
+      if (!attempt.secret) throw new UnlockError("请输入主密码", false, "incomplete");
+      return openWith(kr, credentialFor(SLOT_PASSWORD, { password: attempt.secret }), "wrong-password");
+    }
 }
 
 /**
@@ -96,17 +120,20 @@ export class TotpProvider implements UnlockProvider {
     return !!kr.slots[SLOT_TOTP] && kr.totp.enabled;
   }
 
-  async unlock(kr: KeyringData, attempt: UnlockAttempt): Promise<Uint8Array> {
-    if (!attempt.code) throw new UnlockError("请输入 6 位动态密码");
-    const seed = attempt.totpSeed;
-    if (!seed) throw new UnlockError("请先导入验证器的 otpauth 链接");
-    const ok = await verifyTotp(seed, attempt.code, {
-      digits: kr.totp.digits,
-      step: kr.totp.period,
-    });
-    if (!ok) throw new UnlockError("动态密码不正确", true);
-    return unlockFromCredential(kr, credentialFor(SLOT_TOTP, { totpSeed: seed }));
-  }
+    async unlock(kr: KeyringData, attempt: UnlockAttempt): Promise<Uint8Array> {
+      if (!attempt.code) throw new UnlockError("请输入 6 位动态密码", false, "incomplete");
+      const seed = attempt.totpSeed;
+      if (!seed) throw new UnlockError("请先导入验证器的 otpauth 链接", false, "incomplete");
+      const ok = await verifyTotp(seed, attempt.code, {
+        digits: kr.totp.digits,
+        step: kr.totp.period,
+      });
+      if (!ok) throw new UnlockError("TOTP code rejected", true, "wrong-code");
+      // The code was right, so a rejection from here on is a key problem, not a
+      // typo - most often this device's cached seed is not the one the keyring
+      // was built with.
+      return openWith(kr, credentialFor(SLOT_TOTP, { totpSeed: seed }), "key-mismatch");
+    }
 }
 
 /** Password + TOTP. Both are folded into one KEK with domain separation. */
@@ -118,27 +145,30 @@ export class PasswordTotpProvider implements UnlockProvider {
     { key: "secret", label: "主密码", kind: "password", placeholder: "主密码" },
     { key: "code", label: "6 位验证码", kind: "text", placeholder: "000000", numeric: true, maxLength: 6 },
   ];
-  readonly caution = "两把钥匙缺一不可。换设备时仍可凭主密码 + 恢复密钥进入。";
+  readonly caution = "两把钥匙缺一不可，此模式没有单独的密码通道。换设备时用恢复密钥进入，再导入 otpauth 链接恢复种子。";
 
   isConfigured(kr: KeyringData): boolean {
     return !!kr.slots[SLOT_PASSWORD_TOTP] && kr.totp.enabled;
   }
 
-  async unlock(kr: KeyringData, attempt: UnlockAttempt): Promise<Uint8Array> {
-    if (!attempt.secret) throw new UnlockError("请输入主密码");
-    if (!attempt.code) throw new UnlockError("请输入 6 位动态密码");
-    const seed = attempt.totpSeed;
-    if (!seed) throw new UnlockError("请先导入验证器的 otpauth 链接");
-    const ok = await verifyTotp(seed, attempt.code, {
-      digits: kr.totp.digits,
-      step: kr.totp.period,
-    });
-    if (!ok) throw new UnlockError("动态密码不正确", true);
-    return unlockFromCredential(
-      kr,
-      credentialFor(SLOT_PASSWORD_TOTP, { password: attempt.secret, totpSeed: seed }),
-    );
-  }
+    async unlock(kr: KeyringData, attempt: UnlockAttempt): Promise<Uint8Array> {
+      if (!attempt.secret) throw new UnlockError("请输入主密码", false, "incomplete");
+      if (!attempt.code) throw new UnlockError("请输入 6 位动态密码", false, "incomplete");
+      const seed = attempt.totpSeed;
+      if (!seed) throw new UnlockError("请先导入验证器的 otpauth 链接", false, "incomplete");
+      const ok = await verifyTotp(seed, attempt.code, {
+        digits: kr.totp.digits,
+        step: kr.totp.period,
+      });
+      if (!ok) throw new UnlockError("TOTP code rejected", true, "wrong-code");
+      // Code verified but the pair opens nothing: either the password or the
+      // seed is off. Reported as its own case so the hint can name both.
+      return openWith(
+        kr,
+        credentialFor(SLOT_PASSWORD_TOTP, { password: attempt.secret, totpSeed: seed }),
+        "combined-mismatch",
+      );
+    }
 }
 
 /** Recovery key always works, independent of the configured mode. */
@@ -155,10 +185,14 @@ export class RecoveryProvider implements UnlockProvider {
     return !!kr.slots[SLOT_RECOVERY];
   }
 
-  async unlock(kr: KeyringData, attempt: UnlockAttempt): Promise<Uint8Array> {
-    if (!attempt.secret) throw new UnlockError("请输入恢复密钥");
-    return unlockFromCredential(kr, credentialFor(SLOT_RECOVERY, { recovery: attempt.secret }));
-  }
+    async unlock(kr: KeyringData, attempt: UnlockAttempt): Promise<Uint8Array> {
+      if (!attempt.secret) throw new UnlockError("请输入恢复密钥", false, "incomplete");
+      return openWith(
+        kr,
+        credentialFor(SLOT_RECOVERY, { recovery: attempt.secret }),
+        "wrong-recovery",
+      );
+    }
 }
 
 class ProviderRegistry {

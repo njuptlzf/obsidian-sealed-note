@@ -11,9 +11,14 @@
  */
 
 import { App, TFile, normalizePath } from "obsidian";
-import { KeyCopy, NoteEnvelope, parseNoteEnvelope } from "../core/format";
-import { KeyringData, KeyringSlot, SlotId, parseKeyring, unlockWithRecovery, unlockWithPassword } from "../core/keyring";
-import { FORMAT_KEYRING } from "../core/format";
+import { KeyCopy, NoteEnvelope, parseNoteRef } from "../core/format";
+import {
+  KeyringData,
+  formatKeyringFromCopy,
+  parseKeyring,
+  unlockWithRecovery,
+  unlockWithPassword,
+} from "../core/keyring";
 import { log } from "../util/log";
 import { Err } from "../util/errors";
 
@@ -47,12 +52,14 @@ export class VaultRecoveryService {
     const out: RecoveryCandidate[] = [];
 
     for (const file of files) {
-      // file.extension is "md" for a compound ".sealed.md" name, so use the
-      // full path (the store owns this rule).
-      if (!this.notes.isSealedPath(file.path)) continue;
+      // Notes and payload files both carry key copies; the store owns the rule.
+      if (!this.notes.isKeySourcePath(file.path)) continue;
       try {
-        const raw = await this.app.vault.read(file);
-        const envelope = parseNoteEnvelope(raw);
+        if (this.notes.isSealedPath(file.path)) {
+          const noteRaw = await this.app.vault.read(file);
+          if (parseNoteRef(noteRaw)) continue;
+        }
+        const envelope = await this.notes.tryReadEnvelope(file);
         if (!envelope?.keys) continue;
         out.push({ file, envelope, keyCopy: envelope.keys });
       } catch {
@@ -75,28 +82,9 @@ export class VaultRecoveryService {
     secret: string,
   ): Promise<RecoveryResult> {
     const copy = candidate.keyCopy;
-    const slots: Partial<Record<SlotId, KeyringSlot>> = {};
-
-    for (const [name, cell] of Object.entries(copy.slots)) {
-      slots[name as SlotId] = {
-        gen: cell.gen,
-        salt: cell.salt,
-        wrap: cell.wrap,
-        updatedAt: new Date().toISOString(),
-      };
-    }
-
-    const keyring: KeyringData = {
-      format: FORMAT_KEYRING,
-      vaultId: copy.vaultId,
-      kdf: { hash: copy.kdf.hash as "SHA-256" | "SHA-512", iterations: copy.kdf.iterations },
-      epoch: copy.epoch,
-      slots,
-      totp: { enabled: false, digits: 6, period: 30, mode: "password" },
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      guard: { failCount: 0, lockedUntil: null },
-    };
+    // Reuse the canonical conversion so the rebuilt keyring keeps the TOTP
+    // slot and its mode, exactly like the one NoteKeyringStore.load() returns.
+    const keyring: KeyringData = formatKeyringFromCopy(copy);
 
     // Prove the rebuild is usable before we let the caller persist it.
     const matched = await this.tryUnlock(keyring, secret);

@@ -27,6 +27,8 @@ export class UnlockModal extends Modal {
   private provider: UnlockProvider;
   private error: string | undefined;
   private resolved = false;
+  private totpTimer: number | null = null;
+  private totpHintEl: HTMLElement | null = null;
 
   constructor(
     app: App,
@@ -45,12 +47,22 @@ export class UnlockModal extends Modal {
   }
 
   private render(): void {
+    // Re-render happens on provider/tab switches: stop the old ticker first so
+    // timers never stack up.
+    if (this.totpTimer !== null) {
+      window.clearInterval(this.totpTimer);
+      this.totpTimer = null;
+    }
+    this.totpHintEl = null;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("sealed-modal", "sealed-unlock");
 
+    const encrypting = this.request.verb === "encrypt";
     contentEl.createEl("h2", {
-      text: this.request.subject ? t("prompt.unlockTitle", { name: this.request.subject }) : t("prompt.unlock"),
+      text: this.request.subject
+        ? t(encrypting ? "prompt.encryptTitle" : "prompt.unlockTitle", { name: this.request.subject })
+        : t(encrypting ? "prompt.encrypt" : "prompt.unlock"),
     });
 
     if (this.request.providers.length > 1) {
@@ -106,10 +118,19 @@ export class UnlockModal extends Modal {
           });
         }
       });
-      contentEl.createEl("p", {
-        text: `验证码每 ${30} 秒刷新，当前剩余 ${totpRemainingSeconds()} 秒`,
+      const hint = contentEl.createEl("p", {
+        text: "",
         cls: "sealed-hint sealed-totp-hint",
       });
+      this.totpHintEl = hint;
+      const tick = () => {
+        if (!this.totpHintEl) return;
+        this.totpHintEl.setText(
+          `验证码每 30 秒刷新，当前剩余 ${totpRemainingSeconds()} 秒`,
+        );
+      };
+      tick();
+      this.totpTimer = window.setInterval(tick, 1000);
     }
 
     this.errorEl = contentEl.createDiv({ cls: "sealed-error" });
@@ -118,7 +139,10 @@ export class UnlockModal extends Modal {
     const actions = contentEl.createDiv({ cls: "sealed-actions" });
     const cancel = actions.createEl("button", { text: t("prompt.cancel") });
     cancel.addEventListener("click", () => this.close());
-    const ok = actions.createEl("button", { text: t("prompt.enter"), cls: "mod-cta" });
+    const ok = actions.createEl("button", {
+      text: t(this.request.verb === "encrypt" ? "prompt.encrypt" : "prompt.enter"),
+      cls: "mod-cta",
+    });
     ok.addEventListener("click", () => this.submit());
 
     if (this.provider.caution) {
@@ -143,6 +167,11 @@ export class UnlockModal extends Modal {
   }
 
   onClose(): void {
+    if (this.totpTimer !== null) {
+      window.clearInterval(this.totpTimer);
+      this.totpTimer = null;
+    }
+    this.totpHintEl = null;
     this.contentEl.empty();
     if (!this.resolved) this.resolve(null);
   }

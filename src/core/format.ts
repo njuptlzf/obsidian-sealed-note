@@ -25,6 +25,79 @@ export const FORMAT_KEYRING = "sealed-note/keyring/1";
 export const FORMAT_NOTE = "sealed-note/note/1";
 export const INLINE_VERSION = "sn1";
 
+/**
+ * Legacy note form: the envelope was hidden inside an HTML comment. Kept for
+ * READING old notes only. New notes are a visible placeholder plus a stable ID;
+ * the envelope lives in a sidecar payload file outside the Markdown note.
+ */
+export const NOTE_COMMENT_PREFIX = `<!-- ${FORMAT_NOTE}`;
+export const NOTE_COMMENT_SUFFIX = "-->";
+
+/** A new-style note carries only this opaque reference to its payload file. */
+export const NOTE_REF_PREFIX = "<!-- sealed-note:ref=";
+export const NOTE_REF_SUFFIX = " -->";
+export const PAYLOAD_EXTENSION = ".sealedpayload";
+
+export function noteRefLine(id: string): string {
+  return `${NOTE_REF_PREFIX}${id}${NOTE_REF_SUFFIX}`;
+}
+
+export function parseNoteRef(text: string): string | null {
+  const start = (text ?? "").indexOf(NOTE_REF_PREFIX);
+  if (start < 0) return null;
+  const from = start + NOTE_REF_PREFIX.length;
+  const end = (text ?? "").indexOf(NOTE_REF_SUFFIX, from);
+  if (end < 0) return null;
+  const id = text.slice(from, end).trim();
+  return /^[A-Za-z0-9-]{8,64}$/.test(id) ? id : null;
+}
+
+/**
+ * Note body shown in any Markdown viewer: nothing at all. Both the ref and the
+ * hint are HTML comments, so rendered view is a clean blank page while source
+ * view still carries the stable ID the plugin needs.
+ */
+export function serializeNotePlaceholder(ref: string, hint: string): string {
+  return `${noteRefLine(ref)}\n<!-- ${hint.trim()} -->\n`;
+}
+
+/**
+ * In-place editing: while a note is UNLOCKED its body carries the plaintext
+ * directly (after the invisible ref line). No working-copy file ever exists -
+ * a plaintext file in any folder (hidden or not) is readable without a
+ * password, which defeats the whole point. Locking re-seals and restores the
+ * placeholder body.
+ */
+export function serializeNoteRevealed(ref: string, plaintext: string): string {
+  return `${noteRefLine(ref)}\n${plaintext}`;
+}
+
+/**
+ * Plaintext inside a revealed body, or null when the body is a locked
+ * placeholder (only HTML comments after the ref line).
+ */
+export function parseRevealedBody(text: string): string | null {
+  const src = text ?? "";
+  const start = src.indexOf(NOTE_REF_PREFIX);
+  if (start < 0) return null;
+  const end = src.indexOf(NOTE_REF_SUFFIX, start);
+  if (end < 0) return null;
+  const body = src.slice(end + NOTE_REF_SUFFIX.length);
+  const trimmed = body.trim();
+  if (!trimmed) return "";
+  // A locked placeholder's tail is comment markup, not content.
+  if (trimmed.startsWith("<!--") && trimmed.endsWith("-->")) return null;
+  // serializeNoteRevealed inserts exactly one newline between the ref line and
+  // the plaintext; drop it so reveal -> edit -> flush round-trips byte-for-byte
+  // (otherwise a leading \n leaks into the encrypted payload on every save).
+  return body.startsWith("\n") ? body.slice(1) : body;
+}
+
+/** Payload files are raw JSON: they are not Markdown and need no wrapper. */
+export function serializeNotePayload(envelope: NoteEnvelope): string {
+  return JSON.stringify(envelope, null, 2) + "\n";
+}
+
 /** fenced code block languages we accept as an encrypted block */
 export const INLINE_LANGS = ["encrypted_txt", "txt_encrypted", "sealed"];
 
@@ -114,13 +187,34 @@ export async function sealNote(
     data: toBase64(box.data),
     ...(keyCopy ? { keys: keyCopy } : {}),
   };
-  return JSON.stringify(envelope, null, 2) + "\n";
+  return serializeNoteEnvelope(envelope);
+}
+
+/** Render-safe on-disk form. Only the `keys` field changes on a refresh. */
+export function serializeNoteEnvelope(envelope: NoteEnvelope): string {
+  const json = JSON.stringify(envelope, null, 2);
+  return `${NOTE_COMMENT_PREFIX}\n${json}\n${NOTE_COMMENT_SUFFIX}\n`;
+}
+
+/** Read both the comment-wrapped form and the legacy bare-JSON form. */
+export function noteEnvelopeJson(text: string): string | null {
+  const raw = (text ?? "").trim();
+  if (!raw) return null;
+  if (raw.startsWith("{")) return raw;
+  const start = raw.indexOf(NOTE_COMMENT_PREFIX);
+  if (start < 0) return null;
+  const from = start + NOTE_COMMENT_PREFIX.length;
+  const end = raw.indexOf(NOTE_COMMENT_SUFFIX, from);
+  if (end < 0) return null;
+  return raw.slice(from, end).trim() || null;
 }
 
 export function parseNoteEnvelope(text: string): NoteEnvelope | null {
+  const json = noteEnvelopeJson(text);
+  if (!json) return null;
   let value: unknown;
   try {
-    value = JSON.parse(text);
+    value = JSON.parse(json);
   } catch {
     return null;
   }
@@ -162,7 +256,24 @@ export function makeKeyCopy(
   return { vaultId, kdf: { hash: kdf.hash, iterations: kdf.iterations }, epoch, slots };
 }
 
+/**
+ * Is this already the exact key copy we would write? Used to repair notes whose
+ * copy is stale in CONTENT (e.g. missing the TOTP slot) even when its epoch is
+ * equal. Rewriting only the `keys` field is safe and idempotent.
+ */
+export function keyCopiesEqual(a: KeyCopy, b: KeyCopy): boolean {
+  return (
+    a.epoch === b.epoch &&
+    a.vaultId === b.vaultId &&
+    a.kdf.hash === b.kdf.hash &&
+    a.kdf.iterations === b.kdf.iterations &&
+    JSON.stringify(a.slots) === JSON.stringify(b.slots) &&
+    JSON.stringify(a.totp ?? null) === JSON.stringify(b.totp ?? null)
+  );
+}
+
 export function looksLikeNoteEnvelope(text: string): boolean {
+  if ((text ?? "").trimStart().startsWith(NOTE_COMMENT_PREFIX)) return true;
   return text.trimStart().startsWith(`{"format":"${FORMAT_NOTE}"`) ||
     text.includes(`"${FORMAT_NOTE}"`);
 }

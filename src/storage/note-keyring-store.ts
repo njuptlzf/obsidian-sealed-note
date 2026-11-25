@@ -2,7 +2,9 @@
  * Keyring WITHOUT a keyring file.
  *
  * There is no keyring.json any more. The wrapped vault key lives in the `keys`
- * field of every .sealed note, and those notes are ordinary vault files that
+ * field of every note's sealed payload (legacy notes without a sidecar carry
+ * the envelope in the note body itself), and those files are ordinary vault
+ * files that
  * every sync tool handles (unlike `.obsidian/`, which Remotely Save excludes by
  * default and which a plugin reinstall wipes).
  *
@@ -19,7 +21,7 @@
  */
 
 import { App, TFile, normalizePath } from "obsidian";
-import { KeyCopy, NoteEnvelope, parseNoteEnvelope } from "../core/format";
+import { KeyCopy, NoteEnvelope, keyCopiesEqual, parseNoteRef } from "../core/format";
 import {
   KeyringData,
   KeyringSlot,
@@ -53,14 +55,18 @@ export class NoteKeyringStore {
   async sources(): Promise<NoteKeyringSource[]> {
     const out: NoteKeyringSource[] = [];
     for (const file of this.app.vault.getFiles()) {
-      if (!this.notes.isSealedPath(file.path)) continue;
+      if (!this.notes.isKeySourcePath(file.path)) continue;
       try {
-        const raw = await this.app.vault.read(file);
-        const envelope = parseNoteEnvelope(raw);
+        // A note with a ref is represented by its payload; avoid duplicates.
+        if (this.notes.isSealedPath(file.path)) {
+          const noteRaw = await this.app.vault.read(file);
+          if (parseNoteRef(noteRaw)) continue;
+        }
+        const envelope = await this.notes.tryReadEnvelope(file);
         if (!envelope?.keys) continue;
         out.push({ file, envelope, keyCopy: envelope.keys });
       } catch {
-        /* unreadable notes are not key sources */
+        /* unreadable notes/payloads are not key sources */
       }
     }
     out.sort((a, b) => b.keyCopy.epoch - a.keyCopy.epoch);
@@ -115,7 +121,10 @@ export class NoteKeyringStore {
       // Device-local metadata (the seeded totp.seedRef) can change without an
       // epoch bump: it is not part of the wrapped credential. When force is set
       // we rewrite those copies so a re-import actually persists on this device.
-      if (!opts.force && source.keyCopy.epoch >= copy.epoch) {
+      if (
+        !opts.force &&
+        (source.keyCopy.epoch > copy.epoch || keyCopiesEqual(source.keyCopy, copy))
+      ) {
         skipped++;
         continue;
       }

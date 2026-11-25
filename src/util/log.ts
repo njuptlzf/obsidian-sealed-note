@@ -27,7 +27,12 @@ function sanitize(fields?: Record<string, unknown>): Record<string, unknown> {
       continue;
     }
     if (typeof v === "string" && v.length > 200) {
-      out[k] = `${v.slice(0, 40)}…(${v.length} chars)`;
+      // Stack frames contain only code locations (no secrets); keep every line
+      // so a crash can be traced from the console. Other long strings are
+      // truncated to avoid dumping content/payload into the log.
+      out[k] = k === "stack"
+        ? v.split("\n").map((line) => line.trim()).slice(0, 12)
+        : `${v.slice(0, 40)}…(${v.length} chars)`;
       continue;
     }
     out[k] = v;

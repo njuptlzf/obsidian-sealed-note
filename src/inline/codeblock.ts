@@ -68,7 +68,6 @@ async function renderEncryptedBlock(
       const copy = bar.createEl("button", { text: "复制", cls: "sealed-btn" });
       copy.addEventListener("click", async () => {
         await navigator.clipboard.writeText(plain);
-        plugin.clipboard.noteCopied();
         new Notice("已复制到剪贴板");
       });
       const hide = bar.createEl("button", { text: "隐藏", cls: "sealed-btn" });
@@ -77,12 +76,6 @@ async function renderEncryptedBlock(
         render();
       });
 
-      if (plugin.config().clipboardClearSeconds > 0) {
-        bar.createSpan({
-          text: `${plugin.config().clipboardClearSeconds} 秒后可自动清空剪贴板`,
-          cls: "sealed-hint",
-        });
-      }
       logInline.info("block_decrypted", { path: ctx.sourcePath });
     } catch (error) {
       new Notice(describeError(error), 6000);

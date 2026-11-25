@@ -17,6 +17,8 @@ export interface Registered {
   statusBar: any[];
   events: Array<{ name: string; fn: Function }>;
   domEvents: Array<{ type: string; fn: Function }>;
+  viewSwitches: any[];
+  activeLeafSwitches: any[];
 }
 
 export interface Harness {
@@ -24,6 +26,13 @@ export interface Harness {
   files: Map<string, string>;
   folders: Set<string>;
   notices: string[];
+  /**
+   * Paths whose `remove` fails with EBUSY, modelling a file a sync client or a
+   * virus scanner still holds open. Windows keeps such a name delete-pending,
+   * so the name stays taken until the handle closes - the exact condition that
+   * used to make every later save fail with "Destination file already exists!".
+   */
+  stuckPaths: Set<string>;
   app: any;
 }
 
@@ -38,6 +47,31 @@ export function active(): Harness {
   if (!activeHarness) throw new Error("No harness built yet");
   return activeHarness;
 }
+
+/**
+ * T-classes MUST live at module scope so every harness and the production
+ * `instanceof TFile` check share one class identity. If they were rebuilt
+ * inside buildHarness(), each call creates a different class and instanceof
+ * silently returns false, disabling every file-type guard.
+ */
+export class TAbstractFile {
+  path: string;
+  constructor(path: string) {
+    this.path = path;
+  }
+}
+
+export class TFile extends TAbstractFile {
+  basename: string;
+  extension: string;
+  constructor(path: string) {
+    super(path);
+    this.basename = path.split("/").pop()!.replace(/\.[^.]+$/, "");
+    this.extension = path.split(".").pop()!;
+  }
+}
+
+export class TFolder extends TAbstractFile {}
 
 export function createEl(): any {
   const el: any = {
@@ -111,6 +145,8 @@ export function buildHarness(): { obsidian: any; harness: Harness } {
     statusBar: [],
     events: [],
     domEvents: [],
+    viewSwitches: [],
+    activeLeafSwitches: [],
   };
 
   const files = new Map<string, string>();
@@ -129,6 +165,13 @@ export function buildHarness(): { obsidian: any; harness: Harness } {
     rename: async (from: string, to: string) => {
       const v = files.get(from);
       if (v === undefined) throw new Error("ENOENT: " + from);
+      // Obsidian's DataAdapter refuses to clobber an existing destination (it
+      // checks first and throws this exact message). The stub used to allow it,
+      // which is why a write path that renamed onto an existing file passed
+      // 109 tests while failing on every real save.
+      if (from !== to && (files.has(to) || folders.has(to))) {
+        throw new Error("Destination file already exists!");
+      }
       files.delete(from);
       files.set(to, v);
     },
@@ -140,41 +183,137 @@ export function buildHarness(): { obsidian: any; harness: Harness } {
       folders: [],
     }),
     remove: async (p: string) => {
+      if (active().stuckPaths.has(p)) throw new Error(`EBUSY: resource busy or locked, unlink '${p}'`);
       files.delete(p);
     },
   };
 
-  const harness: Harness = { registered, files, folders, notices, app: null as any };
+  const harness: Harness = { registered, files, folders, notices, stuckPaths: new Set(), app: null as any };
 
   const app: any = {
     vault: {
+      on: (name: string, fn: Function) => {
+        active().registered.events.push({ name: `vault:${name}`, fn });
+        return { name, fn };
+      },
       getName: () => "TestVault",
       adapter,
       getAbstractFileByPath: (p: string) =>
-        files.has(p) ? { path: p, basename: p.split("/").pop()!.replace(/\.[^.]+$/, ""), extension: p.split(".").pop() } : null,
+        files.has(p) ? new TFile(p) : folders.has(p) ? new TFolder(p) : null,
       create: async (p: string, data: string) => {
+        // Same contract as the real Vault: creating over an existing path throws.
+        if (files.has(p) || folders.has(p)) throw new Error("Destination file already exists!");
         files.set(p, data);
-        return {
-          path: p,
-          basename: p.split("/").pop()!.replace(/\.[^.]+$/, ""),
-          extension: p.split(".").pop(),
-        };
+        return new TFile(p);
+      },
+      rename: async (f: any, to: string) => {
+        const from = typeof f === "string" ? f : f.path;
+        const v = files.get(from);
+        if (v === undefined) throw new Error("ENOENT: " + from);
+        if (from !== to && files.has(to)) throw new Error("Destination file already exists!");
+        files.delete(from);
+        files.set(to, v);
       },
       createFolder: async (p: string) => {
         folders.add(p);
       },
       read: async (f: any) => files.get(f.path) ?? "",
-      getFiles: () =>
-        [...files.keys()].map((p) => ({
-          path: p,
-          basename: p.split("/").pop()!.replace(/\.[^.]+$/, ""),
-          extension: p.includes(".") ? p.split(".").pop()! : "",
-        })),
+      cachedRead: async (f: any) => files.get(f.path) ?? "",
+      modify: async (f: any, data: string) => {
+        if (!files.has(f.path)) throw new Error("ENOENT: " + f.path);
+        files.set(f.path, data);
+      },
+      getFiles: () => [...files.keys()].map((p) => new TFile(p)),
+      getMarkdownFiles: () => [...files.keys()].filter((p) => p.endsWith(".md")).map((p) => new TFile(p)),
     },
     workspace: {
-      getActiveFile: () => null,
-      getLeaf: () => ({ openFile: async () => undefined }),
-      getActiveViewOfType: () => null,
+      activePath: null as string | null,
+      getActiveFile: function () {
+        const p = this.activePath;
+        return p ? { path: p, basename: p.split("/").pop()!.replace(/\.[^.]+$/, ""), extension: p.split(".").pop() } : null;
+      },
+      // Tests call this explicitly to simulate the user switching notes.
+      setActiveFile: function (p: string | null) {
+        this.activePath = p;
+      },
+      triggerActiveLeafChange: function () {
+        for (const e of active().registered.events) {
+          if (e.name === "active-leaf-change") e.fn();
+        }
+      },
+      // Closing or opening a tab fires layout-change in the real app; tests
+      // fire it after mutating markdownLeaves to simulate a tab close.
+      triggerLayoutChange: function () {
+        for (const e of active().registered.events) {
+          if (e.name === "layout-change") e.fn();
+        }
+      },
+      triggerFileOpen: function (p: string | null) {
+        const file = p === null ? null : { path: p, basename: p.split("/").pop()!.replace(/\.[^.]+$/, "") };
+        for (const e of active().registered.events) {
+          if (e.name === "file-open") e.fn(file);
+        }
+      },
+      leafOpens: [] as any[],
+      activeLeafIsSide: false as boolean,
+      rootSplit: { kind: "root" },
+      leftSplit: { kind: "left" },
+      rightSplit: { kind: "right" },
+      getLeaf: (mode?: any) => {
+        active().app.workspace.leafOpens.push({ kind: "getLeaf", mode });
+        return {
+          openFile: async (f: any) => {
+            active().registered.viewSwitches.push({ type: "markdown", state: { file: f?.path ?? f } });
+          },
+          parent: active().app.workspace.rootSplit,
+          getRoot: () => active().app.workspace.rootSplit,
+          setViewState: async (state: any) => {
+            active().registered.viewSwitches.push(state);
+          },
+        };
+      },
+      activeLeaf: {
+        view: { getViewType: () => "markdown" },
+        get parent() {
+          const ws = active().app.workspace;
+          return ws.activeLeafIsSide ? ws.leftSplit : ws.rootSplit;
+        },
+        getRoot: function () {
+          const ws = active().app.workspace;
+          return ws.activeLeafIsSide ? ws.leftSplit : ws.rootSplit;
+        },
+        setViewState: async (state: any) => {
+          active().registered.viewSwitches.push(state);
+          active().registered.activeLeafSwitches.push(state);
+        },
+      },
+      getActiveViewOfType: (type: any) => {
+        // Only a Markdown view can be faked (tests need a caret target); the
+        // padlock view has no stub instance, so it still answers null. Matched
+        // by name, and loosely: the plugin and the test are separate bundles,
+        // so esbuild renames the class (MarkdownView2) and class identity is
+        // useless across the boundary.
+        const md = active().app.workspace.mdView;
+        if (!md) return null;
+        return String(type?.name ?? "").includes("MarkdownView") ? md : null;
+      },
+      /** Set by a test that wants to assert where the caret landed. */
+      mdView: null as any,
+      markdownLeaves: [] as any[],
+      sealedLeaves: [] as any[],
+      getLeavesOfType: function (type: string) {
+        if (type === "markdown") return active().app.workspace.markdownLeaves;
+        if (type === "sealed-note-view") return active().app.workspace.sealedLeaves;
+        return [];
+      },
+      // The real API walks every leaf in the workspace; the sweep for closed
+      // tabs (the "close" lock policy) is built on it, so the stub must be
+      // able to answer "is this leaf still alive?" and "which leaf shows this
+      // file?". Tests mutate markdownLeaves/sealedLeaves to open or close
+      // tabs, and this walks the same arrays.
+      iterateAllLeaves: function (cb: Function) {
+        for (const leaf of [...this.markdownLeaves, ...this.sealedLeaves]) cb(leaf);
+      },
       on: (name: string, fn: Function) => {
         active().registered.events.push({ name, fn });
         return { name, fn };
@@ -337,23 +476,8 @@ export function buildHarness(): { obsidian: any; harness: Harness } {
   class ItemView extends FileView {}
   class MarkdownView extends FileView {}
 
-  class TFile {
-    path: string;
-    basename: string;
-    extension: string;
-    constructor(path: string) {
-      this.path = path;
-      this.basename = path.split("/").pop()!.replace(/\.[^.]+$/, "");
-      this.extension = path.split(".").pop()!;
-    }
-  }
-
-  class TFolder {
-    path: string;
-    constructor(path: string) {
-      this.path = path;
-    }
-  }
+  // TAbstractFile/TFile/TFolder now live at true module scope above (shared
+  // class identity with production `instanceof` checks).
 
   class Notice {
     constructor(message: string) {
@@ -365,7 +489,11 @@ export function buildHarness(): { obsidian: any; harness: Harness } {
     items: any[] = [];
     addItem(cb: Function) {
       const item: any = {
-        setTitle: () => item,
+        title: "",
+        setTitle: (value: string) => {
+          item.title = value;
+          return item;
+        },
         setIcon: () => item,
         setSection: () => item,
         setChecked: () => item,
@@ -389,6 +517,7 @@ export function buildHarness(): { obsidian: any; harness: Harness } {
     FileView,
     ItemView,
     MarkdownView,
+    TAbstractFile,
     TFile,
     TFolder,
     Notice,
@@ -418,8 +547,9 @@ export const PluginSettingTab = (_shared.obsidian as any).PluginSettingTab;
 export const FileView = (_shared.obsidian as any).FileView;
 export const ItemView = (_shared.obsidian as any).ItemView;
 export const MarkdownView = (_shared.obsidian as any).MarkdownView;
-export const TFile = (_shared.obsidian as any).TFile;
-export const TFolder = (_shared.obsidian as any).TFolder;
+// TAbstractFile/TFile/TFolder are exported as real module-scope classes
+// above; do NOT re-derive them from a harness build (that would create a
+// second class identity and break production instanceof checks).
 export const Notice = (_shared.obsidian as any).Notice;
 export const Menu = (_shared.obsidian as any).Menu;
 export const normalizePath = (_shared.obsidian as any).normalizePath;

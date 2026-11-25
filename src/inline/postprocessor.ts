@@ -85,7 +85,6 @@ function buildPill(
       // Ctrl/Cmd click copies without ever painting the secret on screen.
       if (event.ctrlKey || event.metaKey) {
         await navigator.clipboard.writeText(plain);
-        plugin.clipboard.noteCopied();
         new Notice("已复制到剪贴板（未显示在屏幕上）");
         return;
       }

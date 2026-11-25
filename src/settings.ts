@@ -2,68 +2,75 @@
 
 import type { Language } from "./i18n";
 
-export type ProviderChoice = "password" | "totp" | "recovery";
+/**
+ * When an unlocked private note re-locks itself.
+ *
+ *   blur    - any focus loss: switching window, app, note, tab or the settings
+ *             page. The strictest level and the default.
+ *   close   - only when you leave the note (switch note, close its tab). Losing
+ *             window focus keeps it open.
+ *   session - only when Obsidian itself closes: unlock once per app session.
+ */
+export type LockPolicy = "blur" | "close" | "session";
 
 export interface SealedNoteSettings {
-  /** 0 = ask every time a note is opened (default, matches the PRD) */
-  keepUnlockedSeconds: number;
-  defaultProvider: ProviderChoice;
-  /** TOTP: require the password first, GitHub style */
-  requirePasswordBeforeTotp: boolean;
   /** UI language: follow Obsidian, or force one */
   language: Language;
   /** extension of private notes */
   extension: string;
+  /** vault-relative folder for per-note encrypted payload files */
+  payloadDir: string;
+  /** delete the sidecar payload when its note is deleted */
+  deletePayloadWithNote: boolean;
   /** show a lock pill in reading view for inline payloads */
   showInlineBadges: boolean;
-  /** auto lock everything when the app loses focus */
-  lockOnBlur: boolean;
+  /** when an unlocked note re-locks itself */
+  lockPolicy: LockPolicy;
   /** confirm before decrypting a whole note in place */
   confirmWholeNoteDecrypt: boolean;
-  /** 0 = off */
-  clipboardClearSeconds: number;
   /** debounce before an edited sealed note is encrypted and written, ms */
   autoSaveMs: number;
 }
 
 export const DEFAULT_SETTINGS: SealedNoteSettings = {
-  keepUnlockedSeconds: 0,
-  defaultProvider: "password",
-  requirePasswordBeforeTotp: false,
   language: "auto" as Language,
   extension: "sealed.md",
+  payloadDir: "sealed-data",
+  deletePayloadWithNote: false,
   showInlineBadges: true,
-  lockOnBlur: false,
+  // Highest privacy by default: the moment focus leaves the note - another
+  // window, another note, another tab, the settings page - it is encrypted and
+  // the key is dropped, so coming back asks for the credential again.
+  lockPolicy: "blur",
   confirmWholeNoteDecrypt: true,
-  clipboardClearSeconds: 0,
   autoSaveMs: 1500,
 };
 
 export function normalizeSettings(raw: unknown): SealedNoteSettings {
   const input = (raw ?? {}) as Partial<SealedNoteSettings>;
   const out: SealedNoteSettings = { ...DEFAULT_SETTINGS };
-  if (typeof input.keepUnlockedSeconds === "number" && input.keepUnlockedSeconds >= 0) {
-    out.keepUnlockedSeconds = Math.min(input.keepUnlockedSeconds, 3600);
-  }
-  if (input.defaultProvider && ["password", "totp", "recovery"].includes(input.defaultProvider)) {
-    out.defaultProvider = input.defaultProvider;
-  }
-  if (typeof input.requirePasswordBeforeTotp === "boolean") {
-    out.requirePasswordBeforeTotp = input.requirePasswordBeforeTotp;
-  }
   if (input.language === "auto" || input.language === "en" || input.language === "zh") {
     out.language = input.language;
   }
   if (typeof input.extension === "string" && /^[a-z0-9.]{2,20}$/i.test(input.extension)) {
     out.extension = input.extension.toLowerCase();
   }
+  if (typeof input.payloadDir === "string" && /^[A-Za-z0-9_-]{1,60}$/.test(input.payloadDir)) {
+    out.payloadDir = input.payloadDir;
+  }
+  if (typeof input.deletePayloadWithNote === "boolean") {
+    out.deletePayloadWithNote = input.deletePayloadWithNote;
+  }
   if (typeof input.showInlineBadges === "boolean") out.showInlineBadges = input.showInlineBadges;
-  if (typeof input.lockOnBlur === "boolean") out.lockOnBlur = input.lockOnBlur;
+  if (input.lockPolicy === "blur" || input.lockPolicy === "close" || input.lockPolicy === "session") {
+    out.lockPolicy = input.lockPolicy;
+  } else if ((input as { lockOnBlur?: boolean }).lockOnBlur === false) {
+    // Migration: the old boolean toggle only knew "lock on blur" (true) and
+    // "never lock on blur" (false), which maps onto the "close" level.
+    out.lockPolicy = "close";
+  }
   if (typeof input.confirmWholeNoteDecrypt === "boolean") {
     out.confirmWholeNoteDecrypt = input.confirmWholeNoteDecrypt;
-  }
-  if (typeof input.clipboardClearSeconds === "number" && input.clipboardClearSeconds >= 0) {
-    out.clipboardClearSeconds = Math.min(input.clipboardClearSeconds, 300);
   }
   if (typeof input.autoSaveMs === "number" && input.autoSaveMs >= 300) {
     out.autoSaveMs = Math.min(input.autoSaveMs, 10000);

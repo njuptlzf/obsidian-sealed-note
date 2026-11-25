@@ -2,7 +2,7 @@
 
 import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type SealedNotePlugin from "../main";
-import { keyFingerprint, describeGuardWait, guardRemainingMs } from "../core/keyring";
+import { keyFingerprint, describeGuardWait, guardRemainingMs, SLOT_PASSWORD } from "../core/keyring";
 import { ConfirmModal, RecoveryKeyModal, SetupModal } from "./modals";
 import { generateRecoveryKey } from "../core/recovery";
 import { createKeyring } from "../core/keyring";
@@ -10,6 +10,7 @@ import { newVaultId } from "../core/keyring";
 import { describeError } from "../util/errors";
 import { t, LANGUAGE_OPTIONS, setLanguage } from "../i18n";
 import type { Language } from "../i18n";
+import type { LockPolicy } from "../settings";
 
 export class SealedNoteSettingTab extends PluginSettingTab {
   constructor(
@@ -64,17 +65,32 @@ export class SealedNoteSettingTab extends PluginSettingTab {
 
     const kr = await this.plugin.unlockService.requireKeyring();
 
+    // Combined mode folds the password into the two-factor credential; there is
+    // deliberately no standalone password slot to report on. Saying "not set"
+    // would imply a gap that is the whole point.
+    const combinedMode = kr.totp.enabled && kr.totp.mode === "password+totp";
+    const passwordDesc = kr.slots.password
+      ? `已设置 · 第 ${kr.slots.password.gen} 代`
+      : combinedMode
+        ? "严格双因子：密码只与动态码组合使用，无独立密码通道"
+        : t("settings.notSet");
+
     new Setting(card)
       .setName(t("settings.password"))
-      .setDesc(kr.slots.password ? `已设置 · 第 ${kr.slots.password.gen} 代` : t("settings.notSet"))
+      .setDesc(passwordDesc)
       .addButton((btn) =>
         btn.setButtonText(t("settings.modify")).onClick(async () => {
           const dek = await this.plugin.unlockService.dekFor("__settings__", { subject: t("settings.changePassword") });
           if (!dek) return;
           const next = await promptPassword(this.app, t("settings.newPassword"));
           if (!next) return;
-          await this.plugin.unlockService.changePassword(dek, next);
-          new Notice(t("notice.passwordChanged"));
+          try {
+            await this.plugin.unlockService.changePassword(dek, next);
+            new Notice(t("notice.passwordChanged"));
+          } catch (error) {
+            new Notice(describeError(error), 10000);
+            return;
+          }
           this.display();
         }),
       );
@@ -112,6 +128,28 @@ export class SealedNoteSettingTab extends PluginSettingTab {
           this.display();
         });
       });
+
+    // Old combined-mode vaults have a standalone password slot beside the
+    // combined one - the single-factor hole. Offer to close it in one click.
+    if (kr.totp.enabled && mode === "password+totp" && kr.slots[SLOT_PASSWORD]) {
+      new Setting(card)
+        .setName(t("settings.harden.title"))
+        .setDesc(t("settings.harden.desc"))
+        .addButton((btn) =>
+          btn.setButtonText(t("settings.harden.button")).setWarning().onClick(async () => {
+            const dek = await this.plugin.unlockService.dekFor("__settings__", { subject: t("settings.harden.title") });
+            if (!dek) return;
+            try {
+              await this.plugin.unlockService.hardenCombinedMode();
+              await this.plugin.keyCopies.refreshAll(await this.plugin.unlockService.requireKeyring());
+              new Notice(t("settings.harden.done"), 10000);
+            } catch (error) {
+              new Notice(describeError(error), 10000);
+            }
+            this.display();
+          }),
+        );
+    }
 
     if (kr.totp.enabled) {
       new Setting(card)
@@ -183,6 +221,38 @@ export class SealedNoteSettingTab extends PluginSettingTab {
       );
 
     new Setting(parent)
+      .setName(t("settings.payloadDir"))
+      .setDesc(t("settings.payloadDirDesc"))
+      .addText((text) =>
+        text
+          .setPlaceholder("sealed-data")
+          .setValue(this.plugin.settingsData.payloadDir)
+          .onChange(async (value) => {
+            this.plugin.settingsData.payloadDir = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(parent)
+      .setName(t("settings.deletePayload"))
+      .setDesc(t("settings.deletePayloadDesc"))
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settingsData.deletePayloadWithNote).onChange(async (value) => {
+          this.plugin.settingsData.deletePayloadWithNote = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(parent)
+      .setName(t("settings.cleanOrphans"))
+      .setDesc(t("settings.cleanOrphansDesc"))
+      .addButton((btn) =>
+        btn.setButtonText(t("settings.cleanOrphansButton")).onClick(async () => {
+          await this.plugin.cleanOrphanPayloads();
+        }),
+      );
+
+    new Setting(parent)
       .setName(t("settings.showBadges"))
       .setDesc(t("settings.showBadgesDesc"))
       .addToggle((toggle) =>
@@ -209,56 +279,18 @@ export class SealedNoteSettingTab extends PluginSettingTab {
     parent.createEl("h3", { text: t("settings.sectionUnlock") });
 
     new Setting(parent)
-      .setName(t("settings.keep"))
-      .setDesc(t("settings.keepDesc"))
-      .addDropdown((dropdown) => {
-        const options: Record<string, string> = {
-          "0": t("settings.keep0"),
-          "60": t("settings.keep60"),
-          "300": t("settings.keep300"),
-          "900": t("settings.keep900"),
-        };
-        dropdown
-          .addOptions(options)
-          .setValue(String(this.plugin.settingsData.keepUnlockedSeconds))
-          .onChange(async (value) => {
-            this.plugin.settingsData.keepUnlockedSeconds = Number.parseInt(value, 10);
-            await this.plugin.saveSettings();
-          });
-      });
-
-    new Setting(parent)
       .setName(t("settings.lockBlur"))
       .setDesc(t("settings.lockBlurDesc"))
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settingsData.lockOnBlur).onChange(async (value) => {
-          this.plugin.settingsData.lockOnBlur = value;
-          await this.plugin.saveSettings();
-        }),
-      );
-
-    new Setting(parent)
-      .setName(t("settings.defaultProvider"))
-      .setDesc(t("settings.defaultProviderDesc"))
       .addDropdown((dropdown) =>
         dropdown
-          .addOptions({ password: t("settings.password"), totp: "动态密码", recovery: t("settings.recovery") })
-          .setValue(this.plugin.settingsData.defaultProvider)
+          .addOptions({
+            blur: t("settings.lockPolicy.blur"),
+            close: t("settings.lockPolicy.close"),
+            session: t("settings.lockPolicy.session"),
+          })
+          .setValue(this.plugin.settingsData.lockPolicy)
           .onChange(async (value) => {
-            this.plugin.settingsData.defaultProvider = value as any;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(parent)
-      .setName(t("settings.clipboard"))
-      .setDesc(t("settings.clipboardDesc"))
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOptions({ "0": t("settings.clip0"), "30": t("settings.clip30"), "60": t("settings.clip60"), "120": t("settings.clip120") })
-          .setValue(String(this.plugin.settingsData.clipboardClearSeconds))
-          .onChange(async (value) => {
-            this.plugin.settingsData.clipboardClearSeconds = Number.parseInt(value, 10);
+            this.plugin.settingsData.lockPolicy = value as LockPolicy;
             await this.plugin.saveSettings();
           }),
       );

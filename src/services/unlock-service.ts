@@ -9,6 +9,7 @@
 import {
   KeyringData,
   UnlockError,
+  UnlockFailureReason,
   describeGuardWait,
   guardRemainingMs,
   registerFailure,
@@ -26,10 +27,34 @@ import {
 import { NoteKeyringStore } from "../storage/note-keyring-store";
 import { ProviderId, UnlockProvider, UnlockAttempt, providersAvailable, needsCode } from "../core/providers";
 import { SessionStore } from "../core/session";
-import { SealedNoteSettings } from "../settings";
 import { log } from "../util/log";
+import { t } from "../i18n";
 import { deviceKeyStorageAvailable, sealWithDevice, openWithDevice } from "../core/device";
-import { Err, describeError } from "../util/errors";
+import { Err, SealedNoteError, describeError } from "../util/errors";
+
+/**
+ * What to tell the user for each way a credential can fail.
+ *
+ * One sentence per cause, each ending in the action that actually fixes it.
+ * Collapsing them into "incorrect, try again" is what made a user with a
+ * correct dynamic code keep retyping it while the real cause was a stale seed.
+ */
+function describeFailure(reason: UnlockFailureReason | undefined, fallback: string): string {
+  switch (reason) {
+    case "wrong-code":
+      return t("unlock.wrongCode");
+    case "wrong-password":
+      return t("unlock.wrongPassword");
+    case "wrong-recovery":
+      return t("unlock.wrongRecovery");
+    case "key-mismatch":
+      return t("unlock.keyMismatch");
+    case "combined-mismatch":
+      return t("unlock.combinedMismatch");
+    default:
+      return fallback;
+  }
+}
 
 export interface UnlockPrompt {
   /** what we are unlocking, shown as the dialog title */
@@ -37,6 +62,8 @@ export interface UnlockPrompt {
   providers: UnlockProvider[];
   provider: UnlockProvider;
   error?: string;
+  /** "unlock" (default) or "encrypt" - changes the dialog wording */
+  verb?: "unlock" | "encrypt";
 }
 
 export interface UnlockUi {
@@ -45,11 +72,20 @@ export interface UnlockUi {
    * when the user picked another method, or null when cancelled.
    */
   prompt(request: UnlockPrompt): Promise<UnlockAttempt & { providerId: ProviderId } | null>;
+  /**
+   * Progress signal for the stretch where the dialog is already gone but the
+   * secret is still being verified. PBKDF2 at the production iteration count
+   * measured ~450ms per configured slot, and unlockFromCredential tries every
+   * slot, so this gap is long enough to look like a freeze. Optional: a headless
+   * or test UI simply does not implement it.
+   */
+  busy?(state: "verifying" | "idle", label?: string): void;
 }
 
 export interface UnlockRequest {
   subject: string;
   preferred?: ProviderId;
+  verb?: "unlock" | "encrypt";
 }
 
 export class UnlockService {
@@ -61,7 +97,6 @@ export class UnlockService {
   constructor(
     private readonly keyringStore: NoteKeyringStore,
     private readonly sessions: SessionStore,
-    private readonly getSettings: () => SealedNoteSettings,
   ) {}
 
   /** Wired by the plugin after the UI layer exists (avoids a circular import). */
@@ -96,12 +131,14 @@ export class UnlockService {
     const available = providersAvailable(kr);
     if (available.length === 0) throw Err.notInitialized();
 
+    // The configured mode already decides which providers exist, and the
+    // registry lists them mode-first (password+totp, password, totp) with
+    // recovery last. So the first available provider IS the chosen method -
+    // no separate "default unlock method" setting is needed.
     const start =
-      available.find((p) => p.id === request?.preferred) ??
-      available.find((p) => p.id === this.getSettings().defaultProvider) ??
-      available[0];
+      available.find((p) => p.id === request?.preferred) ?? available[0];
 
-    return this.interactiveUnlock(filePath, kr, start, available, request?.subject ?? "");
+    return this.interactiveUnlock(filePath, kr, start, available, request?.subject ?? "", request?.verb);
   }
 
   private async interactiveUnlock(
@@ -110,6 +147,7 @@ export class UnlockService {
     start: UnlockProvider,
     available: UnlockProvider[],
     subject: string,
+    verb: "unlock" | "encrypt" = "unlock",
   ): Promise<Uint8Array | null> {
     let provider = start;
     let lastError: string | undefined;
@@ -118,8 +156,10 @@ export class UnlockService {
       const wait = guardRemainingMs(kr.guard);
       if (wait > 0) throw new Error(`尝试次数过多，${describeGuardWait(wait)}`);
 
-      const answer = await this.ui.prompt({ subject, providers: available, provider, error: lastError });
+      this.signalBusy("idle");
+      const answer = await this.ui.prompt({ subject, providers: available, provider, error: lastError, verb });
       if (!answer) {
+        this.signalBusy("idle");
         this.log.info("unlock_cancelled", { path: filePath, provider: provider.id });
         return null;
       }
@@ -134,22 +174,52 @@ export class UnlockService {
       }
 
       try {
+        // The dialog is already closed at this point, so this is the only
+        // feedback the user has while the key is being derived.
+        this.signalBusy("verifying", t("busy.verifying"));
         const dek = await this.performUnlock(kr, provider, answer);
         registerSuccess(kr.guard);
         await this.keyringStore.save(kr).catch(() => undefined);
         this.sessions.put(filePath, dek, provider.id);
         this.log.info("unlock_ok", { path: filePath, provider: provider.id });
         return dek;
-      } catch (error) {
-        if (error instanceof UnlockError) {
-          registerFailure(kr.guard);
-          await this.keyringStore.save(kr).catch(() => undefined);
-          lastError = error.wrongSecret ? `${provider.label}不正确，请重试` : error.message;
-          this.log.warn("unlock_failed", { provider: provider.id, attempts: kr.guard.failCount });
-          continue;
-        }
-        throw error;
+        } catch (error) {
+          if (error instanceof UnlockError) {
+            // Only a rejected secret counts toward the lockout. Submitting an
+            // empty field is not an attempt, and counting it as one locked
+            // people out for a form typo.
+            if (error.wrongSecret) registerFailure(kr.guard);
+            await this.keyringStore.save(kr).catch(() => undefined);
+            lastError = describeFailure(error.reason, error.message);
+            this.log.warn("unlock_failed", {
+              provider: provider.id,
+              reason: error.reason ?? "unknown",
+              attempts: kr.guard.failCount,
+            });
+            continue;
+          }
+          // No usable seed on this device is not a rejected secret: keep the
+          // dialog open so the user can act on the hint where it is visible,
+          // instead of closing it with a toast pointing at a dialog that no
+          // longer exists.
+          if (error instanceof SealedNoteError && error.code === "E_TOTP_DEVICE") {
+            lastError = error.message;
+            this.log.warn("unlock_seed_missing", { provider: provider.id });
+            continue;
+          }
+          throw error;
+        } finally {
+        this.signalBusy("idle");
       }
+    }
+  }
+
+  /** Report progress to the UI when it supports it. Never throws. */
+  signalBusy(state: "verifying" | "idle", label?: string): void {
+    try {
+      this.uiFactory?.().busy?.(state, label);
+    } catch {
+      /* a missing or broken indicator must never break unlocking */
     }
   }
 
@@ -229,6 +299,13 @@ export class UnlockService {
     const kr = await this.requireKeyring();
 
     if (mode === "password") {
+      // A password mode without a password door would be unrecoverable except
+      // via the recovery key; refuse before touching anything.
+      if (!opts.password && !kr.slots[SLOT_PASSWORD]) {
+        throw new Error(
+          "切换为纯密码模式需要先设置一个主密码（当前保管库没有独立的密码通道）。",
+        );
+      }
       delete kr.slots[SLOT_TOTP];
       delete kr.slots[SLOT_PASSWORD_TOTP];
       kr.totp.enabled = false;
@@ -239,6 +316,10 @@ export class UnlockService {
       const seed = normalizeSeed(opts.seed);
       this.sessionTotpSeed = seed;
       delete kr.slots[SLOT_PASSWORD_TOTP];
+      // TOTP-only is genuinely single-factor: phone + code. The old password
+      // must NOT stay as an alternative door, or the mode's promise that the
+      // authenticator is the only way in is false.
+      delete kr.slots[SLOT_PASSWORD];
       kr.totp.enabled = true;
       kr.totp.mode = mode;
       kr.totp.seedRef = (await sealWithDevice(kr.vaultId, seed)) ?? undefined;
@@ -248,6 +329,11 @@ export class UnlockService {
       const seed = normalizeSeed(opts.seed);
       this.sessionTotpSeed = seed;
       delete kr.slots[SLOT_TOTP];
+      // Strict two-factor: switching to combined mode also CLOSES the
+      // single-password door. Keeping the old standalone slot would let the
+      // dialog's 主密码 tab bypass the second factor, contradicting the mode
+      // card's own promise ("两把钥匙缺一不可").
+      delete kr.slots[SLOT_PASSWORD];
       kr.totp.enabled = true;
       kr.totp.mode = mode;
       kr.totp.seedRef = (await sealWithDevice(kr.vaultId, seed)) ?? undefined;
@@ -263,8 +349,49 @@ export class UnlockService {
     this.log.info("unlock_mode_changed", { mode });
   }
 
+  /**
+   * Turn TOTP off and fall back to password-only.
+   *
+   * Kept for API completeness; nothing wires it up right now. It refuses to run
+   * on a strict two-factor vault, where dropping the combined slot would leave
+   * no password door and lock the user out to the recovery key.
+   */
+  /**
+   * Close the standalone password door on an OLD combined-mode vault.
+   *
+   * Vaults configured before strict two-factor kept a password slot beside the
+   * combined one - the single-factor hole this mode was always supposed to not
+   * have. The combined slot already wraps the DEK, so hardening is just: drop
+   * the password slot, bump the epoch, and push the new key copy to every note.
+   * No QR re-scan needed; the caller has already proven the DEK via dekFor.
+   */
+  async hardenCombinedMode(): Promise<void> {
+    const kr = await this.requireKeyring();
+    if (!kr.slots[SLOT_PASSWORD]) return; // already strict
+    if (!kr.totp.enabled || kr.totp.mode !== "password+totp" || !kr.slots[SLOT_PASSWORD_TOTP]) {
+      throw new Error("只有「主密码 + 动态密码」模式才需要收口单密码通道。");
+    }
+    // The combined door must be usable AFTER the old one goes away: a sealed
+    // seed on this device is what makes the next unlock possible.
+    const seed = this.sessionTotpSeed ?? (await this.localSeed(kr));
+    if (!seed) throw Err.totpUnavailable();
+    delete kr.slots[SLOT_PASSWORD];
+    kr.epoch = (kr.epoch ?? 0) + 1;
+    await this.keyringStore.save(kr);
+    const after = await this.keyringStore.load();
+    if (!after?.slots[SLOT_PASSWORD_TOTP] || after.slots[SLOT_PASSWORD]) {
+      throw new Error("收口后的密钥副本异常（组合槽丢失或密码槽仍在），请重试。");
+    }
+    this.log.info("combined_mode_hardened", { epoch: kr.epoch });
+  }
+
   async disableTotp(): Promise<void> {
     const kr = await this.requireKeyring();
+    if (!kr.slots[SLOT_PASSWORD] && kr.slots[SLOT_PASSWORD_TOTP]) {
+      throw new Error(
+        "当前是严格双因子模式（没有单独密码通道）。请先切到「纯密码」模式设置一个主密码，再关闭动态密码。",
+      );
+    }
     delete kr.slots[SLOT_TOTP];
     delete kr.slots[SLOT_PASSWORD_TOTP];
     kr.totp.enabled = false;
@@ -275,23 +402,42 @@ export class UnlockService {
     this.log.info("totp_disabled", {});
   }
 
+  /**
+   * Change the master password.
+   *
+   * In combined mode this rewraps ONLY the combined slot: there is no
+   * standalone password door to maintain, and creating one here would silently
+   * reopen the single-factor hole the mode is supposed to close. The combined
+   * slot needs the TOTP seed; if this device has none (fresh install), refuse
+   * rather than produce a half-rotated keyring.
+   */
   async changePassword(dek: Uint8Array, newPassword: string): Promise<void> {
     const kr = await this.requireKeyring();
-    await setSlot(kr, dek, SLOT_PASSWORD, credentialFor(SLOT_PASSWORD, { password: newPassword }));
-    if (kr.totp.enabled && kr.totp.mode === "password+totp" && this.sessionTotpSeed) {
+    const combined = kr.totp.enabled && kr.totp.mode === "password+totp";
+    if (combined) {
+      const seed = this.sessionTotpSeed ?? (await this.localSeed(kr));
+      if (!seed) {
+        throw new Error(
+          "本机没有可用的动态密码种子，无法改密码。先用恢复密钥完成一次解锁，或在设置「恢复本机种子缓存」导入 otpauth 链接后重试。",
+        );
+      }
+      this.sessionTotpSeed = seed;
       await setSlot(
         kr,
         dek,
         SLOT_PASSWORD_TOTP,
-        credentialFor(SLOT_PASSWORD_TOTP, {
-          password: newPassword,
-          totpSeed: this.sessionTotpSeed,
-        }),
+        credentialFor(SLOT_PASSWORD_TOTP, { password: newPassword, totpSeed: seed }),
+      );
+    } else if (kr.slots[SLOT_PASSWORD]) {
+      await setSlot(kr, dek, SLOT_PASSWORD, credentialFor(SLOT_PASSWORD, { password: newPassword }));
+    } else {
+      throw new Error(
+        "当前模式没有单独的主密码通道，请改用「设置解锁方式」来更换密码。",
       );
     }
     kr.epoch = (kr.epoch ?? 0) + 1;
     await this.keyringStore.save(kr);
-    this.log.info("password_changed", { epoch: kr.epoch });
+    this.log.info("password_changed", { epoch: kr.epoch, mode: combined ? "password+totp" : "password" });
   }
 
   async replaceRecovery(dek: Uint8Array, newRecovery: string): Promise<void> {
@@ -319,13 +465,18 @@ export class UnlockService {
 
   /** Is a usable seed available right now (session memory or this device's seal)? */
   async hasLocalSeed(kr: KeyringData): Promise<boolean> {
-    if (this.sessionTotpSeed) return true;
-    if (!kr.totp.seedRef) return false;
+    return (await this.localSeed(kr)) !== null;
+  }
+
+  /** Read the seed from session memory, else unseal it from this device. */
+  private async localSeed(kr: KeyringData): Promise<string | null> {
+    if (this.sessionTotpSeed) return this.sessionTotpSeed;
+    if (!kr.totp.seedRef) return null;
     try {
       const seed = await openWithDevice(kr.vaultId, kr.totp.seedRef);
-      return !!seed;
+      return seed ? normalizeSeed(seed) : null;
     } catch {
-      return false;
+      return null;
     }
   }
 

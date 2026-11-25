@@ -287,6 +287,19 @@ test("note: round trip, and the file contains no plaintext", async () => {
   assert.equal(await openNote(dek, VAULT, env!), body);
 });
 
+test("note: envelope hides in a Markdown comment, legacy bare JSON still opens", async () => {
+  const dek = newDek();
+  const body = "# 标题\n\n正文\n";
+  const text = await sealNote(dek, VAULT, "kid-1", body);
+  assert.match(text, /^<!-- sealed-note\/note\/1/, "rendered Markdown hides the keys");
+  assert.ok(text.includes("-->"), "comment is closed");
+  assert.equal(await openNote(dek, VAULT, parseNoteEnvelope(text)!), body);
+
+  // Notes written before the comment wrapper must remain readable.
+  const legacy = JSON.stringify(parseNoteEnvelope(text)!);
+  assert.equal(await openNote(dek, VAULT, parseNoteEnvelope(legacy)!), body);
+});
+
 test("note: empty content and unicode survive", async () => {
   const dek = newDek();
   for (const body of ["", "a", "🔒 中文 emoji 🎉", "\r\n\r\n"]) {
@@ -439,34 +452,28 @@ test("TOTP verification allows one step of drift and rejects the rest", async ()
 /* sessions                                                            */
 /* ------------------------------------------------------------------ */
 
-test("session: lock wipes the key buffer and forgets the entry", () => {
-  const store = new SessionStore({ keepMs: 0 });
+test("session: lock forgets the entry and never touches the caller's buffer", () => {
+  const store = new SessionStore();
   const dek = new Uint8Array(32).fill(9);
   store.put("a.sealed", dek, "password");
   assert.ok(store.has("a.sealed"));
+  // The session stores a COPY; mutating through the entry must not alias the
+  // caller's array. (Earlier builds shared the reference and lock() wiped it,
+  // silently zeroing the vault's single DEK and corrupting every later
+  // encrypt - the data-loss bug this assertion now guards.)
+  assert.notEqual(store.get("a.sealed")!.dek, dek, "session holds its own copy");
   assert.ok(store.lock("a.sealed"));
   assert.ok(!store.has("a.sealed"));
-  assert.deepEqual([...dek], new Array(32).fill(0), "buffer wiped");
+  assert.deepEqual([...dek], new Array(32).fill(9), "caller's buffer untouched by lock");
 });
 
 test("session: leaving a note locks it, so coming back asks again", () => {
-  const store = new SessionStore({ keepMs: 0 });
+  const store = new SessionStore();
   store.put("a.sealed", new Uint8Array(32), "password");
   store.put("b.sealed", new Uint8Array(32), "password");
   const locked = store.lockExcept("b.sealed");
   assert.deepEqual(locked, ["a.sealed"]);
   assert.ok(store.has("b.sealed"));
-});
-
-test("session: keepMs=0 locks on leave, keepMs>0 keeps it", () => {
-  const strict = new SessionStore({ keepMs: 0 });
-  strict.put("a", new Uint8Array(32), "password");
-  assert.equal(strict.lockExcept(null).length, 1);
-
-  const relaxed = new SessionStore({ keepMs: 60_000 });
-  relaxed.put("a", new Uint8Array(32), "password");
-  assert.equal(relaxed.lockExcept(null).length, 0);
-  assert.ok(relaxed.has("a"));
 });
 
 test("session: lockAll clears everything", () => {

@@ -189,16 +189,46 @@
   min-height: 60vh;
 }
 
-.sealed-locked {
-  margin: auto;
-  text-align: center;
-  padding: 3rem 1.5rem;
-  max-width: 26rem;
+/* Locked pane: a large padlock covers the whole note so it is obvious the
+   annotation/source is not editable here. */
+.sealed-view-locked {
+  align-items: stretch;
+  justify-content: stretch;
 }
 
-.sealed-locked-icon {
-  font-size: 2.4rem;
-  margin-bottom: 0.5rem;
+.sealed-lock-cover {
+  flex: 1;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  padding: 2rem 1.5rem;
+  text-align: center;
+  background: var(--background-primary);
+}
+
+.sealed-lock-glyph {
+  font-size: clamp(5rem, 18vh, 11rem);
+  line-height: 1;
+  filter: grayscale(0.15);
+  user-select: none;
+}
+
+.sealed-lock-word {
+  font-size: var(--font-ui-large, 18px);
+  font-weight: 600;
+  letter-spacing: 0.35em;
+  padding-left: 0.35em;
+  color: var(--text-muted);
+}
+
+.sealed-locked {
+  margin: 0.75rem auto 0;
+  text-align: center;
+  padding: 0 1rem;
+  max-width: 28rem;
 }
 
 .sealed-locked h3 {
@@ -398,4 +428,73 @@
   grid-column: 2;
   font-size: var(--font-ui-smaller, 12px);
   box-shadow: none;
+}
+
+/* ---------------- busy indicator ---------------- */
+
+/* Shown while the plugin is waiting on a credential or deriving a key. The
+   wait is short but completely silent otherwise; a 450ms PBKDF2 after the
+   dialog closes looks exactly like a freeze. Sits in the middle of the pane:
+   a corner toast is easy to miss and collides with Obsidian's own notices. */
+.sealed-busy {
+  position: fixed;
+  /* Centred in the pane. `inset: 0` + `margin: auto` centres both axes without
+     a transform, so the entry animation below can animate transform freely. */
+  inset: 0;
+  margin: auto;
+  width: fit-content;
+  height: fit-content;
+  z-index: var(--layer-notice, 70);
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.5rem 0.9rem;
+  border-radius: var(--radius-m, 8px);
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: var(--shadow-s, 0 2px 8px rgba(0, 0, 0, 0.15));
+  font-size: var(--font-ui-smaller, 12px);
+  color: var(--text-muted);
+  /* Must never intercept a click: it sits over the editor while the user types. */
+  pointer-events: none;
+  animation: sealed-busy-in 120ms ease-out;
+}
+
+.sealed-busy-ring {
+  width: 0.95em;
+  height: 0.95em;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 2px solid var(--background-modifier-border);
+  border-top-color: var(--interactive-accent, #7c6cf0);
+  animation: sealed-busy-spin 700ms linear infinite;
+}
+
+@keyframes sealed-busy-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes sealed-busy-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Respect users who asked the OS to reduce motion: keep the indicator, drop the
+   spinning (a still ring plus the label still reads as "working"). */
+@media (prefers-reduced-motion: reduce) {
+  .sealed-busy-ring {
+    animation: none;
+    border-top-color: var(--interactive-accent, #7c6cf0);
+  }
+  .sealed-busy {
+    animation: none;
+  }
 }

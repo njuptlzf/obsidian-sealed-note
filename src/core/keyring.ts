@@ -322,11 +322,29 @@ async function unwrapDekFromCredential(
   }
 }
 
+/**
+ * Why a credential was rejected.
+ *
+ * The wording lives in the UI layer, so a provider only has to classify the
+ * failure, not phrase it. This exists because "the code is wrong" and "the code
+ * is right but the key does not match" used to collapse into one "incorrect,
+ * try again" message, which sent users hunting for a password that was already
+ * correct while the real cause was a stale seed or a changed key.
+ */
+export type UnlockFailureReason =
+  | "wrong-code"
+  | "wrong-password"
+  | "wrong-recovery"
+  | "key-mismatch"
+  | "combined-mismatch"
+  | "incomplete";
+
 export class UnlockError extends Error {
   constructor(
     message: string,
     /** true when the secret itself was rejected (counts toward the guard) */
     public readonly wrongSecret = false,
+    public readonly reason?: UnlockFailureReason,
   ) {
     super(message);
     this.name = "UnlockError";
@@ -450,7 +468,7 @@ export async function unlockFromCredential(kr: KeyringData, credential: string):
       continue;
     }
   }
-  throw new UnlockError("Wrong credential", true);
+  throw new UnlockError("No stored slot accepts this credential", true, "key-mismatch");
 }
 
 export async function unlockWithPassword(kr: KeyringData, password: string): Promise<Uint8Array> {

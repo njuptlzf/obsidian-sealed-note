@@ -16,9 +16,9 @@
  */
 
 import { App, TFile } from "obsidian";
-import { KeyringData, parseKeyring } from "../core/keyring";
-import { NoteEnvelope, parseNoteEnvelope } from "../core/format";
-import { SealedNoteStore, keyCopyFromKeyring } from "../storage/sealed-note-store";
+import { KeyringData, keyCopyFromKeyringData, parseKeyring } from "../core/keyring";
+import { keyCopiesEqual, parseNoteRef } from "../core/format";
+import { SealedNoteStore } from "../storage/sealed-note-store";
 import { log } from "../util/log";
 
 export interface RefreshResult {
@@ -49,7 +49,7 @@ export class KeyCopyRefreshService {
     keyring: KeyringData,
     shouldContinue: () => boolean = () => true,
   ): Promise<RefreshResult> {
-    const copy = keyCopyFromKeyring(keyring);
+    const copy = keyCopyFromKeyringData(keyring);
     const result: RefreshResult = {
       current: 0,
       updated: 0,
@@ -62,14 +62,19 @@ export class KeyCopyRefreshService {
     // never read, let alone written.
     const files = this.app.vault
       .getFiles()
-      .filter((f) => this.notes.isSealedPath(f.path));
+      .filter((f) => this.notes.isKeySourcePath(f.path));
 
     for (const file of files) {
       if (!shouldContinue()) break;
 
       try {
-        const raw = await this.app.vault.read(file);
-        const envelope = parseNoteEnvelope(raw);
+        // A ref-based note is represented by its payload file; do not count
+        // the same key copy twice.
+        if (this.notes.isSealedPath(file.path)) {
+          const noteRaw = await this.app.vault.read(file);
+          if (parseNoteRef(noteRaw)) continue;
+        }
+        const envelope = await this.notes.tryReadEnvelope(file);
         if (!envelope) {
           result.failed++;
           result.failures.push(`${file.path}: 不是有效的加密笔记`);
@@ -81,7 +86,9 @@ export class KeyCopyRefreshService {
           result.withoutCopy++;
           continue;
         }
-        if (envelope.keys.epoch >= copy.epoch) {
+        // Never roll a newer note copy back. Equal epoch does not mean equal
+        // content though: older versions dropped the TOTP slot from notes.
+        if (envelope.keys.epoch > copy.epoch || keyCopiesEqual(envelope.keys, copy)) {
           result.current++;
           continue;
         }
@@ -107,14 +114,17 @@ export class KeyCopyRefreshService {
 
   /** How many notes would be changed right now? Cheap preview for the UI. */
   async countStale(keyring: KeyringData): Promise<number> {
-    const copy = keyCopyFromKeyring(keyring);
+    const copy = keyCopyFromKeyringData(keyring);
     let stale = 0;
     for (const file of this.app.vault.getFiles()) {
-      if (!this.notes.isSealedPath(file.path)) continue;
+      if (!this.notes.isKeySourcePath(file.path)) continue;
       try {
-        const raw = await this.app.vault.read(file);
-        const env = parseNoteEnvelope(raw);
-        if (env?.keys && env.keys.epoch < copy.epoch) stale++;
+        if (this.notes.isSealedPath(file.path)) {
+          const noteRaw = await this.app.vault.read(file);
+          if (parseNoteRef(noteRaw)) continue;
+        }
+        const env = await this.notes.tryReadEnvelope(file);
+        if (env?.keys && !keyCopiesEqual(env.keys, copy) && env.keys.epoch <= copy.epoch) stale++;
       } catch {
         /* unreadable files will be reported by refreshAll */
       }

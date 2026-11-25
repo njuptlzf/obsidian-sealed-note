@@ -12,6 +12,7 @@ import {
   Menu,
   Notice,
   Plugin,
+  TAbstractFile,
   TFile,
   TFolder,
   WorkspaceLeaf,
@@ -20,6 +21,7 @@ import {
 } from "obsidian";
 
 import { DEFAULT_SETTINGS, SealedNoteSettings, normalizeSettings } from "./settings";
+import type { LockPolicy } from "./settings";
 import { setLanguage, t } from "./i18n";
 import { SealedNoteSettingTab } from "./ui/settings";
 import { SealedNoteView, SEALED_VIEW_TYPE } from "./notes/sealed-view";
@@ -37,7 +39,7 @@ import { createKeyring, createKeyringWithoutPassword, keyFingerprint, newVaultId
 import { generateTotpSecret, totpUri, formatSecret } from "./core/totp";
 import { describeError, Err } from "./util/errors";
 import { log, setLogLevel } from "./util/log";
-import { openInline } from "./core/format";
+import { openInline, parseNoteRef, serializeNoteRevealed } from "./core/format";
 import { TotpSetupModal } from "./ui/totp-modal";
 import { CandidatePickerModal, SecretPromptModal } from "./ui/recovery-modals";
 import { UnlockModeModal, PasswordPromptModal } from "./ui/mode-modals";
@@ -45,8 +47,15 @@ import { sealWithDevice } from "./core/device";
 import { SeedImportModal } from "./ui/seed-import-modal";
 import { VaultRecoveryService } from "./services/vault-recovery";
 import { KeyCopyRefreshService } from "./services/key-copy-refresh";
+import { RestoreService } from "./services/restore-service";
+import { RestoreModal } from "./ui/restore-modal";
+import { NameModal } from "./ui/name-modal";
+import { BusyOverlay } from "./ui/busy";
 
 const SEALED_ICON = "lock";
+/** how often a freshly created note retries to place the caret (see focusBodyLine) */
+const CARET_ATTEMPTS = 10;
+const CARET_RETRY_MS = 40;
 
 export default class SealedNotePlugin extends Plugin {
   private readonly log = log.child("plugin");
@@ -61,12 +70,39 @@ export default class SealedNotePlugin extends Plugin {
   clipboard!: ClipboardService;
   recovery!: VaultRecoveryService;
   keyCopies!: KeyCopyRefreshService;
+  restoreService!: RestoreService;
 
   private vaultIdentifier = "";
   /** initial keyring, held in memory until the first note can carry it */
   private pendingKeyring: KeyringData | null = null;
+  /** note being created + opened by newSealedNote; file-open hook must skip it */
+  private creatingNotePath: string | null = null;
   private statusBarEl: HTMLElement | null = null;
   private ribbonEl: HTMLElement | null = null;
+
+  /**
+   * In-place editing model. A note is "unlocked" exactly while its body holds
+   * plaintext (sessions) - no working-copy files exist anywhere, so nothing
+   * outside the unlock flow can read plaintext without a password. Any focus
+   * loss (tab switch, window blur, plugin unload) re-seals immediately.
+   */
+  private readonly savingNotes = new Set<string>();
+  /** notes whose unlock is in progress; prevents double prompts */
+  private readonly unlockingNotes = new Set<string>();
+  /** note paths whose body we just rewrote; ignore the resulting modify event */
+  private readonly selfWrites = new Set<string>();
+  /**
+   * path -> the leaf that was showing it at unlock time. The "close" policy
+   * locks a note exactly when THIS leaf is destroyed (tab closed). A leaf that
+   * survives but shows another file means the note was switched away from,
+   * which the close policy deliberately does not lock.
+   */
+  private readonly unlockedLeaves = new Map<string, WorkspaceLeaf>();
+  /** per-note autosave timers */
+  private readonly saveTimers = new Map<string, number>();
+  /** top level progress pill; one at a time, whoever owns busyPath controls it */
+  private readonly busy = new BusyOverlay();
+  private busyPath: string | null = null;
 
   /* ------------------------------------------------------------------ */
   /* lifecycle                                                           */
@@ -84,23 +120,35 @@ export default class SealedNotePlugin extends Plugin {
 
     // Order matters: NoteKeyringStore depends on SealedNoteStore for the
     // ".sealed.md" path rule. Construct the store first.
-    this.notes = new SealedNoteStore(this.app, dataDir);
+    this.notes = new SealedNoteStore(this.app, dataDir, () => this.settingsData.payloadDir);
+    this.notes.setPlaceholderHint(t("note.placeholder"));
+    // Old builds kept plaintext working copies in a visible folder; wipe the
+    // leftovers and warn about notes still revealed from a crash.
+    void this.guard(() => this.recoverAfterCrash());
     this.keyringStore = new NoteKeyringStore(this.app, this.notes);
-    this.sessions = new SessionStore({ keepMs: this.settingsData.keepUnlockedSeconds * 1000 });
+    this.sessions = new SessionStore();
     this.encryption = new EncryptionService(() => this.vaultId());
-    this.clipboard = new ClipboardService(() => this.settingsData.clipboardClearSeconds);
+    this.clipboard = new ClipboardService();
     this.recovery = new VaultRecoveryService(this.app, this.notes);
     this.keyCopies = new KeyCopyRefreshService(this.app, this.notes);
+    this.restoreService = new RestoreService(this.app, this.notes);
 
-    this.unlockService = new UnlockService(this.keyringStore, this.sessions, () => this.settingsData);
+    this.unlockService = new UnlockService(this.keyringStore, this.sessions);
     this.unlockService.setUi(() => ({
       prompt: (request) =>
         new Promise((resolve) => {
+          // The dialog itself is the feedback from here on; leave no spinner
+          // sitting behind it.
+          this.busy.hide();
           new UnlockModal(this.app, request, resolve, async () => {
             const kr = await this.unlockService.keyring();
             return kr ? this.unlockService.hasLocalSeed(kr) : false;
           }).open();
         }),
+      busy: (state, label) => {
+        if (state === "verifying") this.busy.show(label ?? t("busy.verifying"));
+        else this.busy.hide();
+      },
     }));
 
     // Existing keyring decides the vault id; otherwise the id is minted on first setup.
@@ -112,9 +160,13 @@ export default class SealedNotePlugin extends Plugin {
     if (existing) this.vaultIdentifier = existing.vaultId;
 
     this.registerView(SEALED_VIEW_TYPE, (leaf) => new SealedNoteView(leaf, this));
-    // For a compound name like "note.sealed.md", Obsidian's registerExtensions
-    // matches the MIDDLE segment ("sealed"), not the full string and not "md".
-    // This is the same pattern Excalidraw uses for ".excalidraw.md".
+    // Route ".sealed.md" to the big-padlock view: opening shows encrypted
+    // state only, and the user clicks "unlock & edit" to get the modal. This
+    // uses Obsidian's own extension routing (same as Excalidraw's .excalidraw.md)
+    // which opens in a normal tab and never swaps the file-explorer leaf.
+    // The old "file tree overwritten" bug came from our ensureSealedView hook
+    // doing activeLeaf.setViewState - that hook is gone, so this is safe.
+    // Obsidian matches the MIDDLE segment ("sealed"), not ".sealed.md".
     this.registerExtensions([this.extensionToken()], SEALED_VIEW_TYPE);
 
     registerEncryptedCodeBlocks(this);
@@ -126,14 +178,81 @@ export default class SealedNotePlugin extends Plugin {
     this.registerCommands();
     this.registerMenus();
     this.registerLockHooks();
+    this.registerEvent(
+      this.app.vault.on("delete", (file: TAbstractFile) =>
+        void this.guard(async () => this.onNoteDeleted(file)),
+      ),
+    );
+    this.registerEvent(
+      this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) =>
+        void this.guard(async () => this.onNoteRenamed(file, oldPath)),
+      ),
+    );
+    this.registerEvent(
+      this.app.vault.on("modify", (file: TAbstractFile) => {
+        if (!(file instanceof TFile)) return;
+        if (this.selfWrites.has(file.path)) return; // our own re-seal write
+        if (this.isUnlocked(file.path)) this.scheduleFlush(file.path);
+      }),
+    );
 
     this.log.info("loaded", { vault: this.app.vault.getName() });
   }
 
   onunload(): void {
-    this.clipboard?.dispose();
+    this.busy.hide();
+    // Best-effort: flush every unlocked note back into its payload so no
+    // plaintext body survives in the file. Without a DEK we must NOT encrypt
+    // (that would corrupt the payload) - the boot scan handles those notes.
+    for (const path of this.sessions.unlockedPaths()) {
+      const dek = this.sessions.get(path)?.dek ?? null;
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (dek && file instanceof TFile) {
+        const vaultId = this.vaultIdentifier;
+        void this.notes.reSealNote(file, dek, vaultId, vaultId).catch(() => undefined);
+      }
+    }
     this.sessions?.lockAll();
     this.log.info("unloaded", {});
+  }
+
+  /**
+   * After a crash (or an old-version install) some note bodies may still hold
+   * plaintext, and the legacy `sealed-note-work/` folder may hold copies.
+   * Re-seal what we can, delete the legacy folder, and tell the user about
+   * notes that need a credential to close safely.
+   */
+  private async recoverAfterCrash(): Promise<void> {
+    // 1. Legacy working-copy folder from the previous architecture.
+    try {
+      const listed = await this.app.vault.adapter.list("sealed-note-work");
+      for (const path of listed.files ?? []) {
+        await this.app.vault.adapter.remove(path).catch(() => undefined);
+      }
+      if ((listed.files ?? []).length || (listed.folders ?? []).length) {
+        await this.app.vault.adapter.rmdir("sealed-note-work", false).catch(() => undefined);
+        this.log.info("legacy_work_dir_removed");
+      }
+    } catch {
+      /* folder absent - nothing to do */
+    }
+
+    // 2. Notes still revealed on disk (crash while unlocked).
+    const revealed: string[] = [];
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (!this.notes.isSealedPath(file.path)) continue;
+      const raw = await this.app.vault.cachedRead(file).catch(() => "");
+      if (raw && this.notes.isRevealedText(raw)) revealed.push(file.path);
+    }
+    if (revealed.length) {
+      this.log.warn("plaintext_notes_recovered", { count: revealed.length });
+      new Notice(
+        `检测到 ${revealed.length} 篇隐私笔记因异常退出仍是明文状态。打开时会先要求解锁，保存后自动重新加密。`,
+        10000,
+      );
+      // No flag to set: their ciphertext is intact, so opening asks for the
+      // credential and the first save re-seals. Just make it visible.
+    }
   }
 
   /* ------------------------------------------------------------------ */
@@ -162,8 +281,13 @@ export default class SealedNotePlugin extends Plugin {
   async saveSettings(): Promise<void> {
     await this.saveData(this.settingsData);
     setLanguage(this.settingsData.language);
-    this.sessions?.setOptions({ keepMs: this.settingsData.keepUnlockedSeconds * 1000 });
+    this.notes?.setPlaceholderHint(t("note.placeholder"));
     this.refreshStatusBar();
+  }
+
+  /** Which event re-locks an unlocked note. */
+  private lockPolicy(): LockPolicy {
+    return this.settingsData.lockPolicy;
   }
 
   vaultId(): string {
@@ -212,19 +336,27 @@ export default class SealedNotePlugin extends Plugin {
     if (!mode) return null;
 
     let password: string | undefined;
+    let passwordHint: string | undefined;
     if (mode !== "totp") {
       const credentials = await new Promise<{ password: string; hint: string } | null>((resolve) => {
         new SetupModal(this.app, resolve).open();
       });
       if (!credentials) return null;
       password = credentials.password;
+      passwordHint = credentials.hint || undefined;
     }
 
     const recoveryKey = generateRecoveryKey();
     const vaultId = newVaultId();
-    const { keyring, dek } = password
-      ? await createKeyring(vaultId, password, recoveryKey, {})
-      : await createKeyringWithoutPassword(vaultId, recoveryKey, {});
+    // Combined mode deliberately does NOT get a standalone password slot.
+    // createKeyring() wraps the DEK under the password alone; using it here
+    // would leave a "主密码" tab in the dialog that opens the vault without
+    // the second factor, which contradicts "两把钥匙缺一不可". The combined
+    // slot below is the only password-shaped door.
+    const withStandalonePassword = mode === "password";
+    const { keyring, dek } = withStandalonePassword
+      ? await createKeyring(vaultId, password!, recoveryKey, { hint: passwordHint })
+      : await createKeyringWithoutPassword(vaultId, recoveryKey, { hint: passwordHint });
     this.vaultIdentifier = vaultId;
 
     // If TOTP is part of the mode, enrol it now: generate a seed, show the QR,
@@ -316,20 +448,36 @@ export default class SealedNotePlugin extends Plugin {
     this.addCommand({
       id: "lock-current",
       name: t("cmd.lock.name"),
-      callback: () => {
+      callback: () => void this.guard(async () => {
         const file = this.app.workspace.getActiveFile();
-        if (file) this.lockFile(file.path);
-      },
+        if (!file) return;
+        if (this.notes.isSealedPath(file.path) && this.isUnlocked(file.path)) {
+          await this.lockNote(file.path);
+          return;
+        }
+        this.lockFile(file.path);
+      }),
     });
 
     this.addCommand({
       id: "lock-all",
       name: t("cmd.lockAll.name"),
-      callback: () => {
-        const count = this.unlockService.lockAll();
+      callback: () => void this.guard(async () => {
+        const count = await this.lockAllNotes();
         this.refreshStatusBar();
         this.refreshActiveView();
         new Notice(count > 0 ? t("notice.lockedCount", { n: count }) : t("notice.noUnlocked"));
+      }),
+    });
+
+    this.addCommand({
+      id: "restore-annotation",
+      name: t("cmd.restoreAnnotation.name"),
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || !this.notes.isSealedPath(file.path)) return false;
+        if (!checking) void this.guard(() => this.restoreAnnotation(file));
+        return true;
       },
     });
 
@@ -349,6 +497,18 @@ export default class SealedNotePlugin extends Plugin {
       id: "refresh-key-copies",
       name: t("cmd.refreshCopies.name"),
       callback: () => void this.guard(() => this.refreshKeyCopies()),
+    });
+
+    this.addCommand({
+      id: "migrate-to-payloads",
+      name: t("cmd.migrate.name"),
+      callback: () => void this.guard(() => this.migrateToPayloads()),
+    });
+
+    this.addCommand({
+      id: "clean-orphan-payloads",
+      name: t("cmd.cleanOrphans.name"),
+      callback: () => void this.guard(() => this.cleanOrphanPayloads()),
     });
 
     this.addCommand({
@@ -375,9 +535,19 @@ export default class SealedNotePlugin extends Plugin {
     // Editor context menu: encrypt / decrypt selection.
     this.registerEvent(
       this.app.workspace.on("editor-menu", (menu: Menu, editor: Editor) => {
+        const file = this.app.workspace.getActiveFile();
+        menu.addSeparator();
+        // Always available in source mode, for both sealed and plain notes.
+        if (file) {
+          menu.addItem((item) =>
+            item
+              .setTitle(t("cmd.decrypt.document.name"))
+              .setIcon("file-output")
+              .onClick(() => void this.guard(() => this.decryptDocument(file))),
+          );
+        }
         const selection = editor.getSelection();
         if (selection.trim()) {
-          menu.addSeparator();
           menu.addItem((item) =>
             item
               .setTitle(t("menu.encrypt"))
@@ -402,36 +572,50 @@ export default class SealedNotePlugin extends Plugin {
       }),
     );
 
-    // File menu: sealed note actions.
+    // File menu: fires for both files and folders. A folder gets "new note"
+    // only (created inside it); a file gets the full set of actions.
     this.registerEvent(
-      this.app.workspace.on("file-menu", (menu: Menu, file) => {
+      this.app.workspace.on("file-menu", (menu: Menu, file: TAbstractFile) => {
+        if (file instanceof TFolder) {
+          menu.addSeparator();
+          menu.addItem((item) =>
+            item
+              .setTitle(t("cmd.new.name"))
+              .setIcon("lock")
+              .onClick(() => void this.guard(() => this.newSealedNote(file.path))),
+          );
+          return;
+        }
         if (!(file instanceof TFile)) return;
         const isSealed = this.notes.isSealedPath(file.path);
 
+        // Like Obsidian's own "New note": the create action lives on folders,
+        // not on files, so a file right-click only offers decryption actions.
+        // "Decrypt document" works on sealed notes and plain notes alike.
         menu.addSeparator();
         menu.addItem((item) =>
           item
-            .setTitle(t("cmd.new.name"))
-            .setIcon("lock")
-            .onClick(() => void this.guard(() => this.newSealedNote())),
+            .setTitle(t("cmd.decrypt.document.name"))
+            .setIcon("file-output")
+            .onClick(() => void this.guard(() => this.decryptDocument(file))),
         );
 
         if (isSealed) {
-          const unlocked = this.sessions.has(file.path);
+          menu.addItem((item) =>
+            item
+              .setTitle(t("cmd.restoreAnnotation.name"))
+              .setIcon("file-restore")
+              .onClick(() => void this.guard(() => this.restoreAnnotation(file))),
+          );
+          const unlocked = this.isUnlocked(file.path);
           menu.addItem((item) =>
             item
               .setTitle(unlocked ? t("menu.lockNote") : t("prompt.enter"))
               .setIcon(unlocked ? "lock" : "unlock")
               .onClick(() => {
-                if (unlocked) this.lockFile(file.path);
-                else void this.guard(() => this.openFile(file));
+                if (unlocked) void this.guard(() => this.lockNote(file.path));
+                else void this.guard(() => this.unlockNote(file));
               }),
-          );
-          menu.addItem((item) =>
-            item
-              .setTitle(t("menu.decryptWhole"))
-              .setIcon("file-output")
-              .onClick(() => void this.guard(() => this.decryptWholeFile(file))),
           );
         }
       }),
@@ -459,12 +643,12 @@ export default class SealedNotePlugin extends Plugin {
         item
           .setTitle(t("settings.lockAll"))
           .setIcon("lock")
-          .onClick(() => {
-            const count = this.unlockService.lockAll();
+          .onClick(() => void this.guard(async () => {
+            const count = await this.lockAllNotes();
             this.refreshStatusBar();
             this.refreshActiveView();
             new Notice(count ? t("notice.lockedCount", { n: count }) : t("notice.noUnlocked"));
-          }),
+          })),
       );
       menu.addItem((item) =>
         item
@@ -482,12 +666,12 @@ export default class SealedNotePlugin extends Plugin {
   private setupStatusBar(): void {
     this.statusBarEl = this.addStatusBarItem();
     this.statusBarEl.addClass("sealed-status");
-    this.statusBarEl.addEventListener("click", () => {
-      const count = this.unlockService.lockAll();
+    this.statusBarEl.addEventListener("click", () => void this.guard(async () => {
+      const count = await this.lockAllNotes();
       this.refreshStatusBar();
       this.refreshActiveView();
       new Notice(count ? `已锁定 ${count} 篇笔记` : t("status.clickLockAll"));
-    });
+    }));
     this.refreshStatusBar();
   }
 
@@ -505,41 +689,188 @@ export default class SealedNotePlugin extends Plugin {
   }
 
   private registerLockHooks(): void {
-    // Switching notes locks the one you left, so coming back asks again.
+    // Leaving a note: every unlocked note other than the file now on screen
+    // gets re-sealed - but ONLY at the strictest level. "close" deliberately
+    // keeps notes unlocked while you switch around; it locks on tab close
+    // (see sweepClosedNoteTabs). All tabs closed (null) counts as leaving too.
     this.registerEvent(
-      this.app.workspace.on("active-leaf-change", () => {
-        const active = this.app.workspace.getActiveFile();
-        const keep = active?.path ?? null;
-        const locked = this.sessions.lockExcept(keep);
-        if (locked.length) {
-          this.refreshStatusBar();
-          this.log.info("auto_locked", { count: locked.length });
+      this.app.workspace.on("file-open", (file: TFile | null) => {
+        if (this.lockPolicy() === "blur") {
+          for (const path of this.sessions.unlockedPaths()) {
+            if (file && path === file.path) continue;
+            void this.guard(() => this.lockNote(path));
+          }
         }
+        if (!file) return;
+        if (!this.notes.isSealedPath(file.path)) return;
+        // newSealedNote reveals the body itself; the create-triggered file-open
+        // event must not force the padlock view and steal focus.
+        if (file.path === this.creatingNotePath) return;
+        // A workspace-restored tab can point at a note deleted while closed.
+        if (!this.app.vault.getAbstractFileByPath(file.path)) {
+          this.notes.forgetPath(file.path);
+          this.sessions.lock(file.path);
+          return;
+        }
+        void this.guard(async () => {
+          await this.forcePadlockOnFileLeaf(file);
+        });
       }),
     );
 
-    if (this.settingsData.lockOnBlur) {
-      this.registerDomEvent(window, "blur", () => {
-        this.unlockService.lockAll();
+    // Tab/leaf switches still fire active-leaf-change, and some of them do NOT
+    // fire file-open (moving focus between leaves showing the same file, side
+    // panes taking focus). The same blur-level loop runs here as a backstop;
+    // lockNote is idempotent, so the overlap with file-open is harmless.
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", () => {
+        const active = this.app.workspace.getActiveFile();
+        // A null active file is a transient state (modal closing, tab swap,
+        // layout restore). Locking here would close the editor the instant it
+        // opens; the file-open event owns the real transitions.
+        if (!active) return;
+        if (this.lockPolicy() === "blur") {
+          for (const path of this.sessions.unlockedPaths()) {
+            if (path === active.path) continue;
+            void this.guard(() => this.lockNote(path));
+          }
+        }
+        // Switched ONTO a sealed note that is not unlocked: make sure its tab
+        // shows the padlock, never the annotation or a stale plaintext.
+        if (this.notes.isSealedPath(active.path) && !this.isUnlocked(active.path)) {
+          void this.guard(async () => {
+            await this.forcePadlockOnFileLeaf(active);
+          });
+        }
+        this.sweepClosedNoteTabs();
+      }),
+    );
+
+    // Closing a tab destroys its leaf; switching to another note in the same
+    // leaf does not. That is the only way to tell "the note was closed" from
+    // "the note was switched away from", and the "close" policy locks exactly
+    // on the former: a note you merely navigated past stays unlocked (its
+    // plaintext stays in the body until its own tab closes).
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => {
+        this.sweepClosedNoteTabs();
+      }),
+    );
+
+    // Window blur = focus loss = lock everything. Only the strictest policy
+    // treats "another window" as a reason to drop the key: the whole point of
+    // the lower levels is to stop asking the moment you look away.
+    this.registerDomEvent(window, "blur", () => {
+      if (this.lockPolicy() !== "blur") return;
+      void this.guard(async () => {
+        await this.lockAllNotes();
         this.refreshStatusBar();
         this.refreshActiveView();
       });
+    });
+
+    // Obsidian's settings pane is not a leaf, so no leaf-change event fires for
+    // it. Patch its opener so "switch to the settings page" counts as leaving
+    // the note at the strictest level.
+    this.hookSettingsOpen();
+    this.app.workspace.onLayoutReady?.(() => this.hookSettingsOpen());
+  }
+
+  /**
+   * Lock everything when Obsidian's settings pane opens.
+   *
+   * There is no public event for it, and it is not a workspace leaf, so the
+   * only place to hook is `app.setting.open`. Internal API: a missing or
+   * changed shape must never break loading, hence the try/catch and the flag.
+   */
+  private hookSettingsOpen(): void {
+    try {
+      const setting = (this.app as any).setting;
+      if (!setting || typeof setting.open !== "function" || setting.__sealedNotePatched) return;
+      const open = setting.open.bind(setting);
+      setting.open = (...args: unknown[]) => {
+        if (this.lockPolicy() === "blur") {
+          void this.guard(async () => {
+            await this.lockAllNotes();
+            this.refreshStatusBar();
+          });
+        }
+        return open(...args);
+      };
+      setting.__sealedNotePatched = true;
+    } catch (error) {
+      this.log.warn("settings_hook_failed", { error: String(error) });
     }
   }
 
   private refreshActiveView(): void {
     const view = this.app.workspace.getActiveViewOfType(SealedNoteView);
-    if (view && view.file) {
-      // Re-render through a reload so the locked state is accurate.
-      void view.onLoadFile(view.file);
+    if (view) view.showLocked();
+  }
+
+  /**
+   * Remember which leaf is showing a note right after it was unlocked.
+   *
+   * The "close" policy needs to tell "its tab was closed" (leaf destroyed)
+   * from "it was switched away in the same leaf" (leaf alive, showing another
+   * file). The recorded leaf is what makes that distinction.
+   */
+  private rememberLeafFor(path: string): void {
+    const leaves: WorkspaceLeaf[] = [
+      ...(this.app.workspace.getLeavesOfType?.("markdown") ?? []),
+      ...(this.app.workspace.getLeavesOfType?.(SEALED_VIEW_TYPE) ?? []),
+    ];
+    for (const leaf of leaves) {
+      if ((leaf.view as any)?.file?.path === path) {
+        this.unlockedLeaves.set(path, leaf);
+        return;
+      }
     }
+    // Not found (unexpected right after showAsMarkdown): no reliable leaf to
+    // watch, so the sweep will not guess - the blur/unload paths still lock it.
+    this.unlockedLeaves.delete(path);
+  }
+
+  /**
+   * The "close" policy locks a note exactly when the tab that was showing it
+   * is destroyed. A leaf that survives but shows another file means the note
+   * was switched away from, which stays unlocked by design - that is the whole
+   * difference from "blur".
+   */
+  private sweepClosedNoteTabs(): void {
+    if (this.lockPolicy() !== "close") return;
+    if (!this.app.workspace.iterateAllLeaves) return; // unknown API: do not guess
+    for (const path of this.sessions.unlockedPaths()) {
+      if (this.anyLeafShows(path)) continue; // its tab is still open somewhere
+      const leaf = this.unlockedLeaves.get(path);
+      if (!leaf) continue; // no reliable leaf: do not guess, other hooks still lock
+      if (this.leafAlive(leaf)) continue; // switched away, not closed
+      this.unlockedLeaves.delete(path);
+      void this.guard(() => this.lockNote(path));
+    }
+  }
+
+  private anyLeafShows(path: string): boolean {
+    let found = false;
+    this.app.workspace.iterateAllLeaves((leaf: WorkspaceLeaf) => {
+      if ((leaf.view as any)?.file?.path === path) found = true;
+    });
+    return found;
+  }
+
+  private leafAlive(leaf: WorkspaceLeaf): boolean {
+    let alive = false;
+    this.app.workspace.iterateAllLeaves((candidate: WorkspaceLeaf) => {
+      if (candidate === leaf) alive = true;
+    });
+    return alive;
   }
 
   private lockFile(path: string): void {
     this.unlockService.lock(path);
     this.refreshStatusBar();
     const view = this.app.workspace.getActiveViewOfType(SealedNoteView);
-    if (view && view.file?.path === path) void view.onLoadFile(view.file);
+    if (view && view.file?.path === path) view.showLocked();
     new Notice(t("notice.locked"));
   }
 
@@ -553,30 +884,128 @@ export default class SealedNotePlugin extends Plugin {
       await action();
     } catch (error) {
       if (error instanceof Error && (error as any).name === "E_CANCELLED") return;
-      this.log.error("action_failed", { error: String(error) });
+      this.log.error("action_failed", { error: String(error), stack: error instanceof Error ? error.stack : undefined });
       new Notice(describeError(error), 8000);
     }
   }
 
-  async newSealedNote(): Promise<void> {
-    const dek = await this.requireInitialised();
-    if (!dek) return;
-
-    // Match Obsidian's own "New note": create next to the active file, or at
-    // the vault root when nothing is focused. No separate folder setting.
-    const folder = this.currentNoteFolder();
+  async newSealedNote(folderOverride?: string, givenName?: string): Promise<void> {
+    // Ask for a name first (skip when supplied by a test/caller). The plugin
+    // adds .sealed.md itself; the user just types "Daily" etc.
     const stamp = new Date();
-    const name = `${t("note.defaultName")} ${stamp.getFullYear()}-${String(stamp.getMonth() + 1).padStart(2, "0")}-${String(
-      stamp.getDate(),
-    ).padStart(2, "0")} ${String(stamp.getHours()).padStart(2, "0")}${String(stamp.getMinutes()).padStart(2, "0")}`;
-    const path = normalizePath(folder ? `${folder}/${name}` : name);
+    const defaultName = t("note.nameLabel").includes("e.g.")
+      ? `Untitled ${stamp.getHours()}${String(stamp.getMinutes()).padStart(2, "0")}`
+      : `未命名 ${stamp.getHours()}${String(stamp.getMinutes()).padStart(2, "0")}`;
+    const name = givenName ?? (await new Promise<string | null>((resolve) => {
+      new NameModal(
+        this.app,
+        t("note.nameTitle"),
+        t("note.nameLabel"),
+        defaultName,
+        t("note.nameHint"),
+        resolve,
+      ).open();
+    }));
+    if (!name) return;
+    // Normalize whatever the user typed: strip any .sealed[.md] / .md they
+    // included - we always append exactly one canonical .sealed.md ourselves.
+    const cleanName = name.replace(/\.sealed\.md$/i, "").replace(/\.sealed$/i, "").replace(/\.md$/i, "");
 
-    const kr = this.pendingKeyring ?? (await this.unlockService.requireKeyring());
-    const file = await this.notes.create({ vaultId: kr.vaultId, kid: kr.vaultId, keyring: kr }, dek, path, name);
-    this.pendingKeyring = null;
-    this.sessions.put(file.path, dek, "setup");
-    await this.openFile(file);
+    // Creating a NEW note needs the real DEK up front.
+    //
+    // The alternative - create with a throwaway key and ask on the first save -
+    // meant a window where the note existed but was not encrypted. Every bug
+    // that window produced (text parked in a draft when the user cancelled, a
+    // stale throwaway envelope that could never be decrypted, crash recovery for
+    // bodies left revealed) came from it. Asking before the file exists deletes
+    // the whole state machine: cancelling leaves nothing behind.
+    let kr: KeyringData;
+    let dek: Uint8Array | null = null;
+    let providerId = "create";
+    if (!(await this.hasKeyring())) {
+      // First run: the wizard mints the keyring and hands back its DEK.
+      dek = await this.runSetup();
+      if (!dek) return;
+      kr = this.pendingKeyring!;
+      providerId = "setup";
+    } else {
+      kr = await this.unlockService.requireKeyring();
+      this.vaultIdentifier = kr.vaultId;
+      // Reuse a DEK already in memory: same vault, same key.
+      for (const open of this.sessions.unlockedPaths()) {
+        const entry = this.sessions.get(open);
+        if (entry) {
+          dek = entry.dek;
+          providerId = entry.providerId;
+          break;
+        }
+      }
+    }
+
+    // Match Obsidian's own "New note": create next to the active file, at the
+    // vault root when nothing is focused, or in the folder that was right-
+    // clicked. No separate folder setting.
+    const folder = folderOverride ?? this.currentNoteFolder();
+    const path = normalizePath(folder ? `${folder}/${cleanName}` : cleanName);
+    const targetPath = this.notes.withExtension(path);
+
+    if (!dek) {
+      this.claimBusy(targetPath, t("busy.encrypting"));
+      try {
+        dek = await this.unlockService.dekFor(targetPath, { subject: name, verb: "encrypt" });
+      } finally {
+        this.releaseBusy(targetPath);
+      }
+      if (!dek) {
+        // Cancelled: no note, no empty file, nothing to clean up later.
+        new Notice(t("notice.createCancelled"), 6000);
+        this.log.info("note_create_cancelled");
+        return;
+      }
+    }
+
+    this.creatingNotePath = targetPath;
+    try {
+      const file = await this.notes.create(
+        { vaultId: kr.vaultId, kid: kr.vaultId, keyring: kr },
+        dek,
+        path,
+        name,
+        t("note.placeholder"),
+      );
+      this.pendingKeyring = null;
+      this.sessions.put(file.path, dek, providerId);
+      // Reveal the (empty) body in place and open the native editor, exactly
+      // like Obsidian's own "new note". No working copy, no second prompt.
+      await this.revealBlank(file);
+      await this.showAsMarkdown(file.path);
+      this.rememberLeafFor(file.path);
+      // The tab switch fires active-leaf-change; make sure the create itself
+      // is not treated as "left the note".
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+      this.refreshStatusBar();
+      // Start typing below the ID comment, never inside it.
+      this.focusBodyLine(file.path);
+    } finally {
+      this.creatingNotePath = null;
+    }
     new Notice(t("notice.created"));
+  }
+
+  /** Write an empty revealed body for a brand-new note. */
+  private async revealBlank(file: TFile): Promise<void> {
+    const ref = this.notes.refForPath(file.path) ?? (await this.refOf(file));
+    if (!ref) throw Err.io(`无法读取笔记 ID：${file.path}`);
+    // "Blank" describes the expected state, it is not a licence to clear the
+    // body. Only called right after create() now, so this can never fire - kept
+    // as a guard because writing "" over a body that holds text is the one
+    // mistake this file must never make.
+    const existing = await this.notes.readRevealedBody(file).catch(() => "");
+    if (existing) {
+      this.log.warn("reveal_blank_on_nonempty_body", { note: file.path, chars: existing.length });
+      return;
+    }
+    await this.markSelfWrite(file.path, () => this.app.vault.modify(file, serializeNoteRevealed(ref, "")));
   }
 
   /**
@@ -590,8 +1019,365 @@ export default class SealedNotePlugin extends Plugin {
     return slash < 0 ? "" : active.path.slice(0, slash);
   }
 
+  /**
+   * Whether a leaf lives in the main editor area rather than a side dock.
+   *
+   * Do NOT use leaf.getRoot()/getContainer(): both return the TOP-LEVEL
+   * container (WorkspaceRoot / WorkspaceWindow), which is the SAME object for
+   * a sidebar leaf - so `=== rootSplit` is always true and the check never
+   * filters anything. leaf.isSideLeaf() is not an API either. The reliable
+   * test is walking `parent` up to the split containers.
+   */
+  private isMainAreaLeaf(leaf: any): boolean {
+    try {
+      const ws = this.app.workspace as any;
+      let node: any = leaf;
+      let guard = 0;
+      while (node && guard++ < 64) {
+        if (node === ws.leftSplit || node === ws.rightSplit) return false;
+        if (ws.rootSplit && node === ws.rootSplit) return true;
+        node = node.parent;
+      }
+      // Unknown tree (typically the test stub): assume main area so calls that
+      // open a tab still succeed rather than silently doing nothing.
+      return true;
+    } catch {
+      return true;
+    }
+  }
+
+  /** Inverse of isMainAreaLeaf; kept for call sites that skip side panes. */
+  private isSideLeaf(leaf: any): boolean {
+    return !this.isMainAreaLeaf(leaf);
+  }
+
+  /* ---------------- in-place unlock / lock ------------------------------- */
+
+  /** A note is unlocked exactly while its DEK is in the session store. */
+  isUnlocked(path: string): boolean {
+    return !!this.sessions.get(path);
+  }
+
+  /**
+   * Unlock a sealed note IN PLACE: decrypt the payload into the note's own
+   * body and switch its tab to the native Markdown editor. No working-copy
+   * file exists anywhere - plaintext lives in the note only while unlocked,
+   * and every focus-loss path re-seals it. This is what makes "open the file
+   * from the tree without a password" impossible.
+   */
+  async unlockNote(noteFile: TFile | null): Promise<void> {
+    if (!noteFile || !this.notes.isSealedPath(noteFile.path)) return;
+    if (this.unlockingNotes.has(noteFile.path)) return;
+
+    this.unlockingNotes.add(noteFile.path);
+    try {
+      // Reuse a live session's DEK if we have one; otherwise ask. We ALWAYS run
+      // the reveal step, even when a session exists, because a crash or a
+      // half-finished lock can leave a session with a still-placeholder body.
+      // revealNote is idempotent - a revealed body is left untouched, which is
+      // also what keeps text typed before a crash from being overwritten.
+      const existing = this.sessions.get(noteFile.path)?.dek ?? null;
+      const dek = existing ?? (await this.unlockService.dekFor(noteFile.path, { subject: noteFile.basename }));
+      if (!dek) return; // user cancelled
+
+      try {
+        await this.notes.revealNote(noteFile, dek, this.vaultId());
+      } catch (error) {
+        if ((error as any)?.code !== "E_BAD_ENVELOPE") throw error;
+        // A note damaged by an external editor: seal its bytes before showing.
+        const raw = await this.notes.readCiphertext(noteFile);
+        const kr = await this.unlockService.requireKeyring();
+        await this.notes.writePlaintext(noteFile, dek, this.vaultId(), this.vaultId(), raw, kr);
+        new Notice(
+          "这个文件不是有效的密文信封（可能被其他编辑器写成了明文）。已把当前内容加密保存，旧文件已备份。",
+          10000,
+        );
+        const ref = this.notes.refForPath(noteFile.path) ?? (await this.refOf(noteFile));
+        if (ref) await this.markSelfWrite(noteFile.path, () => this.app.vault.modify(noteFile, serializeNoteRevealed(ref, raw)));
+      }
+      this.sessions.put(noteFile.path, dek, "unlock");
+      await this.showAsMarkdown(noteFile.path);
+      this.rememberLeafFor(noteFile.path);
+      this.refreshStatusBar();
+      this.log.info("note_unlocked", { note: noteFile.path });
+    } finally {
+      this.unlockingNotes.delete(noteFile.path);
+    }
+  }
+
+  private async refOf(noteFile: TFile): Promise<string | null> {
+    const raw = await this.app.vault.read(noteFile).catch(() => "");
+    return parseNoteRef(raw);
+  }
+
+  /**
+   * Lock a note: flush plaintext into the payload, restore the placeholder
+   * body, drop the DEK.
+   *
+   * Never prompts. This runs from background hooks (tab switch, window blur,
+   * unload), and a credential dialog appearing because the user clicked another
+   * tab would be worse than the alternative. If the key is somehow gone, the
+   * note stays open with a warning instead of being reported as locked while its
+   * body is still plaintext.
+   */
+  async lockNote(notePath: string): Promise<void> {
+    const timer = this.saveTimers.get(notePath);
+    if (timer) window.clearTimeout(timer);
+    this.saveTimers.delete(notePath);
+    this.unlockedLeaves.delete(notePath);
+    // Locking ends the editing session, so any pill claimed by a debounced flush
+    // must go with it.
+    const release = () => this.releaseBusy(notePath);
+
+    const file = this.app.vault.getAbstractFileByPath(notePath);
+    if (!(file instanceof TFile)) {
+      this.sessions.lock(notePath);
+      release();
+      return;
+    }
+    if (!this.isUnlocked(notePath)) {
+      release();
+      return; // already locked
+    }
+
+    const dek = this.sessions.get(notePath)?.dek ?? null;
+    try {
+      if (!dek) {
+        // Only reachable if the session expired between the two checks above.
+        this.log.warn("lock_without_key", { note: notePath });
+        new Notice(t("notice.lockNoKey"), 8000);
+        return;
+      }
+      const kr = await this.unlockService.requireKeyring();
+      this.vaultIdentifier = kr.vaultId;
+
+      await this.markSelfWrite(notePath, () => this.notes.reSealNote(file, dek, kr.vaultId, kr.vaultId, kr));
+      this.sessions.lock(notePath);
+      await this.showAsPadlock(notePath);
+      this.refreshStatusBar();
+      this.log.info("note_locked", { note: notePath });
+    } finally {
+      release();
+    }
+  }
+
+  /** Flush the revealed body into the payload WITHOUT locking (autosave). */
+  async flushNote(notePath: string): Promise<void> {
+    if (this.savingNotes.has(notePath)) return;
+    const file = this.app.vault.getAbstractFileByPath(notePath);
+    if (!(file instanceof TFile)) return;
+    if (!this.isUnlocked(notePath)) return;
+
+    const dek = this.sessions.get(notePath)?.dek ?? null;
+    if (!dek) {
+      // An autosave must never raise a dialog in the middle of typing. The text
+      // is still in the body and lock will seal it, so skipping this flush is
+      // recoverable; interrupting the user is not.
+      this.log.warn("flush_without_key", { note: notePath });
+      return;
+    }
+    const kr = await this.unlockService.requireKeyring();
+    this.vaultIdentifier = kr.vaultId;
+    this.savingNotes.add(notePath);
+    try {
+      const plaintext = await this.notes.readRevealedBody(file);
+      await this.notes.writePlaintext(file, dek, kr.vaultId, kr.vaultId, plaintext, kr);
+      this.log.info("note_flushed", { note: notePath });
+    } finally {
+      this.savingNotes.delete(notePath);
+    }
+  }
+
+  private scheduleFlush(notePath: string): void {
+    const prev = this.saveTimers.get(notePath);
+    if (prev) window.clearTimeout(prev);
+    // Silent by design: an unlocked note always has its DEK, so the flush below
+    // is a 3ms write that never needs the user. No progress pill, no dialog.
+    const timer = window.setTimeout(() => {
+      this.saveTimers.delete(notePath);
+      void this.guard(() => this.flushNote(notePath));
+    }, this.settingsData.autoSaveMs ?? 1500);
+    this.saveTimers.set(notePath, timer);
+  }
+
+  /**
+   * Take ownership of the progress pill for one note. Ownership matters because
+   * a stale release (from a slower, older save) must not hide the indicator a
+   * newer save just put up.
+   */
+  private claimBusy(notePath: string, label: string): void {
+    this.busyPath = notePath;
+    this.busy.show(label);
+  }
+
+  private releaseBusy(notePath: string): void {
+    // Ownership check: a stale release from an older operation must not hide a
+    // pill a newer one just put up.
+    if (this.busyPath !== null && this.busyPath !== notePath) return;
+    this.busyPath = null;
+    this.busy.hide();
+  }
+
+  /** Run a vault write we made ourselves, suppressing our modify handler. */
+  private async markSelfWrite(path: string, write: () => Promise<void>): Promise<void> {
+    this.selfWrites.add(path);
+    try {
+      await write();
+    } finally {
+      // modify events fire async; keep the guard alive briefly.
+      window.setTimeout(() => this.selfWrites.delete(path), 300);
+    }
+  }
+
+  /** Switch leaves showing `path` from the padlock view to Markdown. */
+  /**
+   * Make sure the note is shown in the native Markdown editor. Two cases:
+   * a) it is open in a padlock leaf - switch THAT leaf (never the sidebar);
+   * b) it is not open anywhere (unlock from the right-click menu) - open it
+   *    in a main-area leaf. getLeaf(false)/activeLeaf can be the file
+   *    explorer, so reuse it only when it is verifiably main-area, else
+   *    getLeaf(true), which the docs guarantee creates inside rootSplit.
+   */
+  private async showAsMarkdown(path: string): Promise<void> {
+    const ws = this.app.workspace as any;
+    const padlockLeaves = ws.getLeavesOfType?.(SEALED_VIEW_TYPE) ?? [];
+    for (const leaf of padlockLeaves) {
+      if ((leaf.view as any)?.file?.path !== path) continue;
+      if (this.isSideLeaf(leaf)) continue;
+      await leaf.setViewState({ type: "markdown", state: { file: path }, active: true } as any);
+      await ws.revealLeaf?.(leaf);
+      return;
+    }
+    // Already showing as Markdown somewhere? Just reveal it.
+    const mdLeaves = ws.getLeavesOfType?.("markdown") ?? [];
+    for (const leaf of mdLeaves) {
+      if ((leaf.view as any)?.file?.path === path && !this.isSideLeaf(leaf)) {
+        await ws.revealLeaf?.(leaf);
+        return;
+      }
+    }
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!file) return;
+    const active = ws.activeLeaf;
+    const leaf = active && this.isMainAreaLeaf(active) ? active : ws.getLeaf(true);
+    if (!leaf) throw Err.io("无法打开编辑器标签页");
+    await leaf.setViewState({ type: "markdown", state: { file: path }, active: true } as any);
+    await ws.revealLeaf?.(leaf);
+  }
+
+  /**
+   * Put the caret on the first line AFTER the invisible ID comment.
+   *
+   * A brand-new note's body is just `<!-- sealed-note:ref=… -->` plus a trailing
+   * newline, and an empty editor parks the caret at offset 0 - inside the
+   * comment. Typing there would eat the note's ID, and backspacing would delete
+   * the annotation outright. Placing the caret on the next line also matches
+   * where a user expects to start writing.
+   *
+   * The editor mounts a moment after the leaf switch, so this retries briefly
+   * instead of assuming the view is ready; it never throws.
+   */
+  private focusBodyLine(path: string): void {
+    const place = (attempt: number): void => {
+      const view = this.markdownViewFor(path);
+      const editor = view?.editor;
+      // Guard the document as well: a view can be mounted before its text is
+      // loaded, and a caret placed then would land back inside the comment.
+      if (!view || !editor || editor.lineCount() < 2) {
+        if (attempt >= CARET_ATTEMPTS) return;
+        window.setTimeout(() => place(attempt + 1), CARET_RETRY_MS);
+        return;
+      }
+      const line = editor.lineCount() - 1;
+      editor.setCursor({ line, ch: (editor.getLine(line) ?? "").length });
+      editor.focus();
+    };
+    place(0);
+  }
+
+  /** The Markdown view currently showing `path`, if any. */
+  private markdownViewFor(path: string): MarkdownView | null {
+    const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (active?.file?.path === path) return active;
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown") ?? []) {
+      const view = leaf.view as MarkdownView;
+      if ((view as any)?.file?.path === path) return view;
+    }
+    return null;
+  }
+
+  /** Switch Markdown leaves showing `path` back to the padlock view. */
+  private async showAsPadlock(path: string): Promise<void> {
+    await this.padlockMatchingLeaves(path);
+  }
+
+  /**
+   * Ensure a sealed note is displayed by our padlock view, by switching ONLY
+   * the leaf that currently shows this file. Matching on the leaf's displayed
+   * file path is what keeps the file explorer safe: it is a "file-explorer"
+   * view and never appears in getLeavesOfType("markdown"), so it can't be
+   * turned into a padlock. (Using activeLeaf here was the old overwrite bug.)
+   */
+  private async forcePadlockOnFileLeaf(file: TFile): Promise<void> {
+    // An unlocked note is legitimately edited in the Markdown view right now.
+    if (this.isUnlocked(file.path)) return;
+    let shown = await this.padlockMatchingLeaves(file.path);
+    if (!shown) {
+      // file-open fires before Obsidian finishes mounting the native Markdown
+      // view, so at that instant no leaf may match yet. Recheck on the next
+      // tick, after the native open has settled.
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+      shown = await this.padlockMatchingLeaves(file.path);
+    }
+    if (!shown) this.log.warn("padlock_no_leaf", { path: file.path });
+  }
+
+  /** Switch every non-sidebar Markdown leaf showing `path` to the padlock. */
+  private async padlockMatchingLeaves(path: string): Promise<boolean> {
+    const leaves = this.app.workspace.getLeavesOfType?.("markdown") ?? [];
+    let shown = false;
+    for (const leaf of leaves) {
+      if ((leaf.view as any)?.file?.path !== path) continue;
+      if (this.isSideLeaf(leaf)) continue;
+      if (leaf.view?.getViewType?.() === SEALED_VIEW_TYPE) {
+        shown = true;
+        continue;
+      }
+      try {
+        await leaf.setViewState({ type: SEALED_VIEW_TYPE, state: { file: path } });
+        this.log.info("padlock_shown", { path });
+        shown = true;
+      } catch (error) {
+        this.log.warn("padlock_switch_failed", { path, error: String(error) });
+      }
+    }
+    return shown;
+  }
+
+  /** Lock every unlocked note; returns how many were locked. */
+  private async lockAllNotes(): Promise<number> {
+    const paths = new Set<string>(this.sessions.unlockedPaths());
+    let locked = 0;
+    for (const path of paths) {
+      const before = this.isUnlocked(path);
+      await this.lockNote(path);
+      if (before && !this.isUnlocked(path)) locked++;
+    }
+    this.unlockService.lockAll();
+    return locked;
+  }
+
   private async openFile(file: TFile): Promise<void> {
-    const leaf = this.app.workspace.getLeaf(false);
+    // getLeaf(false) reuses the active leaf, which may be the file explorer.
+    // Use a main-area leaf so opening never replaces the sidebar.
+    const leaf = this.app.workspace.getLeaf(true);
+    if (this.notes.isSealedPath(file.path)) {
+      // Obsidian sees ".md" and would happily open the ciphertext envelope in
+      // the Markdown editor. That would show JSON and let Ctrl+S write raw
+      // plaintext over it. Force our view explicitly.
+      await leaf.setViewState({ type: SEALED_VIEW_TYPE, state: { file: file.path } });
+      return;
+    }
     await leaf.openFile(file);
   }
 
@@ -696,6 +1482,41 @@ export default class SealedNotePlugin extends Plugin {
     this.log.info("whole_note_decrypted", { source: file.path, target });
   }
 
+  /**
+   * One "Decrypt document" entry for both note kinds:
+   *   - sealed note -> create a plaintext .md copy (ciphertext stays intact)
+   *   - plain note  -> decrypt every encrypted block inline, in place
+   */
+  async decryptDocument(file: TFile): Promise<void> {
+    if (this.notes.isSealedPath(file.path)) {
+      await this.decryptWholeFile(file);
+      return;
+    }
+    const dek = await this.unlockService.dekFor(file.path, { subject: file.basename });
+    if (!dek) return;
+    const source = await this.app.vault.read(file);
+    const result = await this.encryption.decryptAll(dek, source);
+    if (result.fenced + result.inline === 0) {
+      new Notice(t("notice.notEncrypted"));
+      return;
+    }
+    await this.app.vault.modify(file, result.text);
+    new Notice(t("notice.decryptedDocument"));
+    this.log.info("document_decrypted", { path: file.path, ...{ fenced: result.fenced, inline: result.inline } });
+  }
+
+  /** Open the two-step recovery-key / pick-candidate dialog for a sealed note. */
+  async restoreAnnotation(file: TFile): Promise<void> {
+    new RestoreModal(this.app, file.basename, {
+      collect: (recovery) => this.restoreService.collectCandidates(recovery.trim()),
+      choose: async (candidate) => {
+        await this.restoreService.restore(file, candidate);
+        this.notes.forgetPath(file.path);
+        this.refreshStatusBar();
+      },
+    }).open();
+  }
+
   /* ---------------- recovery / totp ---------------- */
 
   /**
@@ -720,6 +1541,128 @@ export default class SealedNotePlugin extends Plugin {
     if (result.failures.length) {
       this.log.warn("key_copy_refresh_partial", { failures: result.failures });
     }
+  }
+
+  /** Move old embedded envelopes into one sidecar payload per note. */
+  async migrateToPayloads(): Promise<void> {
+    const notes = this.app.vault.getFiles().filter((f) => this.notes.isSealedPath(f.path));
+    let migrated = 0;
+    let skipped = 0;
+    let failed = 0;
+    for (const file of notes) {
+      try {
+        if (await this.notes.migrateLegacy(file)) migrated++;
+        else skipped++;
+      } catch (error) {
+        failed++;
+        this.log.warn("migrate_failed", { path: file.path, error: String(error) });
+      }
+    }
+    new Notice(
+      t("notice.migrated", { n: migrated, skip: skipped, fail: failed }),
+      failed ? 10000 : 8000,
+    );
+  }
+
+  /**
+   * A private note is identified by the .sealed.md suffix. If the user renames
+   * one and drops that suffix, it would silently become an ordinary note and
+   * lose its unlock entry point. Put the suffix back automatically, and carry
+   * all internal state (ID cache, session, pending flag) to the new path.
+   */
+  private async onNoteRenamed(file: TAbstractFile, oldPath: string): Promise<void> {
+    if (!file || typeof file.path !== "string") return;
+    // atomicWrite swaps a note through "<path>.old" before putting the new
+    // bytes in place, so Obsidian reports renames that are ours, not the user's.
+    // Treating those as a real rename would rewrite the suffix of the scratch
+    // file and could re-key our caches onto it.
+    if (/(\.tmp|\.old)$/i.test(file.path) || /(\.tmp|\.old)$/i.test(oldPath)) return;
+
+    const wasSealed = this.notes.isSealedPath(oldPath);
+    if (!wasSealed) return; // not a private note before the rename
+
+    // The canonical path always ends in .sealed.md. Strip any .sealed[.md]
+    // the user left on, then re-add the canonical suffix.
+    const base = file.path.replace(/\.sealed\.md$/i, "").replace(/\.sealed$/i, "").replace(/\.md$/i, "");
+    const finalPath = this.notes.withExtension(base);
+
+    if (file.path !== finalPath) {
+      if (!this.app.vault.getAbstractFileByPath(finalPath)) {
+        await this.app.vault.rename(file, finalPath);
+        new Notice(t("notice.suffixRestored", { name: finalPath }), 6000);
+        this.log.info("suffix_restored", { from: file.path, to: finalPath });
+      }
+    }
+
+    // Move cached ID / session / pending state from the old path to the final
+    // path. The body (and its ref line) travels with the file, so payloads are
+    // unaffected; only our in-memory maps need re-keying.
+    this.notes.moveRef(oldPath, finalPath);
+    const session = this.sessions.get(oldPath);
+    if (session) {
+      this.sessions.put(finalPath, session.dek, session.providerId);
+      this.sessions.lock(oldPath);
+    }
+    if (this.busyPath === oldPath) this.busyPath = finalPath;
+  }
+
+  /** Delete the payload when its note goes away (default on). */
+  private async onNoteDeleted(file: TAbstractFile): Promise<void> {
+    if (!file || typeof file.path !== "string") return;
+    if (!this.notes.isSealedPath(file.path)) return;
+    // Drop any in-memory state for the vanished note.
+    const timer = this.saveTimers.get(file.path);
+    if (timer) window.clearTimeout(timer);
+    this.saveTimers.delete(file.path);
+    this.sessions.lock(file.path);
+    this.releaseBusy(file.path);
+    // Always drop the cached ref when a note disappears, even when we keep the
+    // ciphertext: otherwise the payload still looks "referenced" and the
+    // clean-orphans command will never find it.
+    const ref =
+      this.notes.refForPath(file.path) ??
+      parseNoteRef(await this.app.vault.adapter.read(file.path).catch(() => ""));
+    this.notes.forgetPath(file.path);
+    this.refreshStatusBar();
+    if (!this.settingsData.deletePayloadWithNote) return;
+    if (!ref) return;
+    if (await this.notes.deletePayload(ref)) {
+      this.log.info("payload_deleted_with_note", { note: file.path, ref });
+    }
+  }
+
+  /** Remove payload files that no note refers to any more. */
+  async cleanOrphanPayloads(): Promise<void> {
+    const orphans = await this.notes.orphanPayloads();
+    if (orphans.length === 0) {
+      new Notice(t("notice.noOrphans"));
+      return;
+    }
+    const ok = await new Promise<boolean>((resolve) => {
+      new ConfirmModal(
+        this.app,
+        {
+          title: t("confirm.cleanOrphansTitle"),
+          body: t("confirm.cleanOrphansBody", { n: orphans.length, list: orphans.slice(0, 10).map((f) => f.path).join("\n") }),
+          confirmText: t("confirm.cleanOrphansOk"),
+          danger: true,
+          typeToConfirm: "DELETE",
+        },
+        resolve,
+      ).open();
+    });
+    if (!ok) return;
+
+    let removed = 0;
+    for (const file of orphans) {
+      try {
+        await this.app.vault.adapter.remove(file.path);
+        removed++;
+      } catch (error) {
+        this.log.warn("orphan_payload_remove_failed", { path: file.path, error: String(error) });
+      }
+    }
+    new Notice(t("notice.orphansCleaned", { n: removed, fail: orphans.length - removed }));
   }
 
   /**
@@ -868,7 +1811,19 @@ export default class SealedNotePlugin extends Plugin {
     if (!mode) return;
 
     if (mode === "password") {
-      await this.unlockService.configureMode(dek, mode, { password: undefined });
+      // From a strict two-factor vault the standalone password slot no longer
+      // exists (and in TOTP-only mode it never did). configureMode("password")
+      // with no password would then leave a "password mode" with no password
+      // door - only recovery could get back in. Ask for one whenever the vault
+      // currently has no standalone password to keep.
+      const hasPasswordDoor = !!kr.slots[SLOT_PASSWORD];
+      const credentials = hasPasswordDoor
+        ? null
+        : await new Promise<{ password: string; hint: string } | null>((resolve) => {
+            new SetupModal(this.app, resolve).open();
+          });
+      if (!hasPasswordDoor && !credentials) return;
+      await this.unlockService.configureMode(dek, mode, { password: credentials?.password });
       new Notice(t("notice.modePassword"));
       return;
     }

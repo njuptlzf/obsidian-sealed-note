@@ -1,27 +1,15 @@
 /**
- * The ".sealed" note view.
+ * The ".sealed.md" view is now only a locked-state entry point.
  *
- * Core invariant: the file on disk is only ever ciphertext. The plaintext lives
- * in this view's editor buffer, which is in memory. Ctrl+S encrypts and writes;
- * the buffer is not the source of truth for what is stored.
- *
- * Why a custom view instead of a normal Markdown file with an encrypted body:
- * a normal .md file would put the ciphertext in the search index, in the graph,
- * in link suggestions, and in every other plugin's reach. A dedicated extension
- * keeps the ciphertext out of all of it. The trade off is that other tools
- * cannot read the file - the offline decryptor covers that case.
+ * Editing happens IN the note: the plugin reveals the plaintext into the
+ * note's own body inside Obsidian's native MarkdownView, so users keep
+ * source/live-preview modes, immersive mode and every editor command. This
+ * view just shows the locked state and offers "unlock & edit". All
+ * plaintext/ciphertext handling lives in the plugin and
+ * SealedNoteStore; nothing here holds decrypted content.
  */
 
-import {
-  FileView,
-  ItemView,
-  Menu,
-  Notice,
-  TFile,
-  WorkspaceLeaf,
-  MarkdownView,
-  Editor,
-} from "obsidian";
+import { FileView, Menu, Notice, TFile, WorkspaceLeaf } from "obsidian";
 import type SealedNotePlugin from "../main";
 import { describeError } from "../util/errors";
 import { log } from "../util/log";
@@ -30,13 +18,8 @@ export const SEALED_VIEW_TYPE = "sealed-note-view";
 
 export class SealedNoteView extends FileView {
   private readonly log = log.child("view");
-  private plaintext = "";
-  private dirty = false;
   private unlocking = false;
-  private saveTimer: number | null = null;
-  private textarea: HTMLTextAreaElement | null = null;
 
-  /** This view cannot exist without a backing file. */
   allowNoFile = false;
 
   constructor(
@@ -55,194 +38,86 @@ export class SealedNoteView extends FileView {
   }
 
   getIcon(): string {
-    return this.isUnlocked() ? "unlock" : "lock";
+    return "lock";
   }
 
   canAcceptExtension(extension: string): boolean {
-    // Obsidian passes the registered token ("sealed"), not "md".
     return extension === this.plugin.extensionToken();
   }
 
   /* ---------------- lifecycle ---------------- */
 
-  async onLoadFile(file: TFile): Promise<void> {
-    this.render();
-    await this.unlockAndLoad(file);
+  async onLoadFile(file: TFile | null): Promise<void> {
+    // Only render the big padlock. Unlocking is driven solely by the plugin's
+    // file-open hook (awaiting ensureSealedView before opening the working
+    // copy). Doing both here caused two view switches to race on the same leaf
+    // - the locked pane flashed and focus was lost during first-run setup.
+    // Obsidian may pass null on transient states; render handles that.
+    this.render(file);
   }
 
-  async onUnloadFile(file: TFile): Promise<void> {
-    // Leaving the note locks it: coming back must ask again (PRD).
-    await this.flushPendingSave();
-    this.plugin.unlockService.lock(file.path);
-    this.plaintext = "";
-    this.dirty = false;
-    this.render();
+  /** Re-render the locked state only; used after an explicit lock. */
+  showLocked(): void {
+    this.render(this.file);
+  }
+
+  async onUnloadFile(_file: TFile): Promise<void> {
+    // No plaintext lives here; the plugin owns reveal/re-seal lifecycle.
   }
 
   onunload(): void {
-    if (this.saveTimer) window.clearTimeout(this.saveTimer);
-    if (this.file) this.plugin.unlockService.lock(this.file.path);
+    // nothing to flush
   }
 
-  isUnlocked(): boolean {
-    return !!this.file && this.plugin.unlockService.unlockedCount() > 0 && this.plaintextLoaded;
+  /* ---------------- render ---------------- */
+
+  private render(file: TFile | null): void {
+    const root = this.contentEl;
+    root.empty();
+    root.addClass("sealed-view", "sealed-view-locked");
+
+    // A big padlock covering the pane makes the locked state unmistakable and
+    // signals that the annotation/source is not editable here.
+    const cover = root.createDiv({ cls: "sealed-lock-cover" });
+    cover.createDiv({ cls: "sealed-lock-glyph", text: "🔒" });
+    cover.createDiv({ cls: "sealed-lock-word", text: "已加密" });
+    const box = cover.createDiv({ cls: "sealed-locked" });
+    box.createEl("h3", { text: file?.basename ?? "加密笔记" });
+    box.createEl("p", {
+      text: "这篇笔记的内容已加密到独立的密文文件中，此处不能直接编辑。点击下方按钮，用你设置的方式解锁后，明文会就地写入本篇笔记，在原生 Markdown 编辑器里继续写作；锁定时立即加密回密文文件并恢复占位符。",
+      cls: "sealed-hint",
+    });
+    const btn = box.createEl("button", { text: "解锁并编辑", cls: "mod-cta" });
+    btn.addEventListener("click", () => {
+      if (file) void this.unlock(file);
+    });
   }
 
-  private plaintextLoaded = false;
-
-  /* ---------------- unlock ---------------- */
-
-  private async unlockAndLoad(file: TFile): Promise<void> {
-    if (this.unlocking) return;
+  private async unlock(file: TFile | null): Promise<void> {
+    if (!file || this.unlocking) return;
+    // A workspace-restored tab can point at a note that was deleted while
+    // Obsidian was closed. The TFile is stale; opening would silently fail and
+    // leave the user stuck on the padlock. Say so plainly instead.
+    if (!this.app.vault.getAbstractFileByPath(file.path)) {
+      new Notice(`这篇笔记已不存在（${file.basename}），可能已被删除。请关闭此标签。`, 8000);
+      return;
+    }
     this.unlocking = true;
     try {
-      const dek = await this.plugin.unlockService.dekFor(file.path, {
-        subject: file.basename,
-      });
-      if (!dek) {
-        this.render();
-        return;
-      }
-      this.plaintext = await this.plugin.notes.readPlaintext(file, dek, this.plugin.vaultId());
-      this.plaintextLoaded = true;
-      this.dirty = false;
-      this.render();
-      this.plugin.refreshStatusBar();
+      await this.plugin.unlockNote(file);
     } catch (error) {
       this.log.error("open_failed", { path: file.path, error: String(error) });
       new Notice(describeError(error), 8000);
-      this.render();
     } finally {
       this.unlocking = false;
     }
   }
 
-  /* ---------------- render ---------------- */
-
-  private render(): void {
-    const root = this.contentEl;
-    root.empty();
-    root.addClass("sealed-view");
-
-    if (!this.plaintextLoaded) {
-      this.renderLocked(root);
-      return;
-    }
-
-    const bar = root.createDiv({ cls: "sealed-toolbar" });
-    bar.createSpan({ text: "🔓 已解锁 · 保存后写入密文", cls: "sealed-toolbar-label" });
-    const lockBtn = bar.createEl("button", { text: "锁定", cls: "sealed-btn" });
-    lockBtn.addEventListener("click", () => {
-      if (this.file) {
-        this.plugin.unlockService.lock(this.file.path);
-        this.plaintext = "";
-        this.plaintextLoaded = false;
-        this.dirty = false;
-        this.render();
-        this.plugin.refreshStatusBar();
-      }
-    });
-
-    const area = root.createEl("textarea", { cls: "sealed-editor" });
-    area.value = this.plaintext;
-    area.spellcheck = false;
-    this.textarea = area;
-    area.addEventListener("input", () => {
-      this.plaintext = area.value;
-      this.dirty = true;
-      this.scheduleSave();
-    });
-    area.addEventListener("keydown", (event) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
-        event.preventDefault();
-        void this.save();
-      }
-    });
-    window.setTimeout(() => area.focus(), 20);
-  }
-
-  private renderLocked(root: HTMLElement): void {
-    const box = root.createDiv({ cls: "sealed-locked" });
-    box.createDiv({ cls: "sealed-locked-icon", text: "🔒" });
-    box.createEl("h3", { text: this.file?.basename ?? "加密笔记" });
-    box.createEl("p", {
-      text: "这篇笔记以密文形式保存在磁盘上。点击下方按钮解锁查看。",
-      cls: "sealed-hint",
-    });
-    const btn = box.createEl("button", { text: "解锁", cls: "mod-cta" });
-    btn.addEventListener("click", () => {
-      if (this.file) void this.unlockAndLoad(this.file);
-    });
-  }
-
-  /* ---------------- save ---------------- */
-
-  private scheduleSave(): void {
-    if (this.saveTimer) window.clearTimeout(this.saveTimer);
-    this.saveTimer = window.setTimeout(() => {
-      void this.save();
-    }, this.plugin.config().autoSaveMs ?? 1500);
-  }
-
-  async save(): Promise<void> {
-    if (!this.file || !this.plaintextLoaded || !this.dirty) return;
-    const dek = await this.plugin.unlockService.dekFor(this.file.path);
-    if (!dek) return;
-    try {
-      const kr = await this.plugin.unlockService.requireKeyring();
-      await this.plugin.notes.writePlaintext(
-        this.file,
-        dek,
-        this.plugin.vaultId(),
-        this.plugin.vaultId(),
-        this.plaintext,
-        kr,
-      );
-      this.dirty = false;
-      this.log.info("note_saved", { path: this.file.path });
-    } catch (error) {
-      new Notice(`保存失败：${describeError(error)}`, 8000);
-      this.log.error("save_failed", { path: this.file.path, error: String(error) });
-    }
-  }
-
-  private async flushPendingSave(): Promise<void> {
-    if (this.saveTimer) {
-      window.clearTimeout(this.saveTimer);
-      this.saveTimer = null;
-    }
-    if (this.dirty) await this.save();
-  }
-
   /* ---------------- menus ---------------- */
 
-  onPaneMenu(menu: Menu, source: string): void {
-    super.onPaneMenu(menu, source);
-    const file = this.file;
-    if (!file) return;
-    menu.addItem((item) =>
-      item
-        .setTitle("锁定这篇笔记")
-        .setIcon("lock")
-        .onClick(() => {
-          this.plugin.unlockService.lock(file.path);
-          this.plaintext = "";
-          this.plaintextLoaded = false;
-          this.render();
-          this.plugin.refreshStatusBar();
-        }),
-    );
-  }
-
-  /** Expose the buffer so commands can operate on it. */
-  getPlaintext(): string {
-    return this.plaintext;
-  }
-
-  setPlaintext(value: string): void {
-    this.plaintext = value;
-    this.dirty = true;
-    if (this.textarea) this.textarea.value = value;
-    this.scheduleSave();
+  onPaneMenu(menu: Menu, _source: string): void {
+    super.onPaneMenu(menu, _source);
+    // Working copies are normal Markdown files; locking is offered by the
+    // plugin's global commands and the sealed view's unlock flow.
   }
 }
