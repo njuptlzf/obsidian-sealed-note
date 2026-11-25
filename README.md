@@ -1,153 +1,95 @@
 # Sealed Note
 
-Obsidian 隐私笔记插件：**只加密你指定的笔记和片段**，不加密整个保管库。忘记密码不会导致数据永久丢失。
+**English** | [简体中文](README.zh-CN.md)
+
+An Obsidian plugin that encrypts **only the notes and fragments you choose** — not your whole vault. Losing your password never means permanently losing your data: a recovery key resets the password and rewraps the same data key without touching a single byte of your notes.
+
+## Screenshots
+
+![Settings page and the unlock-method picker (password + TOTP / password only / TOTP only)](docs/screenshots/settings-unlock-method.png)
+
+*Settings page with the "Choose an unlock method" modal.*
+
+![Locked private note — the padlock view, "Unlock and edit"](docs/screenshots/locked-note-view.png)
+
+*A private note in its locked state: the body is covered by a padlock until you unlock it.*
+
+## Features
+
+- **Only what you mark is encrypted** — full private notes (`.sealed.md`), inline blocks, and inline `sn1.…` fragments. The rest of the vault stays plain and searchable.
+- **Password can be reset, never recovered** — anyone claiming to recover your password either deceives you or kept a backdoor. Here the recovery key rewraps the same data key; note content is never re-encrypted.
+- **No keyring file** — the wrapped key lives in the `keys` field of every note's ciphertext payload, so it syncs with your notes and any one note can unlock the whole vault.
+- **Native Markdown editing** — on unlock the plaintext is written **in place** into the note's own body: source mode, live preview, immersive mode and every editor command work as usual. There is never a second plaintext file on disk.
+- **Three unlock modes, switchable any time** — password only, TOTP only, or password + TOTP as strict two-factor (no password-only door exists in that mode). The recovery key is always the last-resort channel.
+- **Automatic locking** — a three-tier policy (blur / close note / per-session) decides when an unlocked note re-encrypts and drops its key, defaulting to the strictest: lock on any focus loss.
+- **Offline emergency decrypt** — a single self-contained `tools/decrypt.html` that needs no network, for verifying backups or decrypting on a machine without Obsidian.
+- **Desktop & mobile** — depends only on Web Crypto, no Node API.
+
+> 📖 Crypto principles, glossary and architecture: **[docs/CRYPTO.md](docs/CRYPTO.md)** · TOTP internals: **[docs/TOTP-PRINCIPLE.md](docs/TOTP-PRINCIPLE.md)**
 
 ---
 
-## 三个要点
-
-1. **密码无法被找回，但可以重置。** 任何声称能找回密码的加密产品，要么在骗你，要么留了后门。这里用恢复密钥重设密码，笔记一字不动。
-2. **没有密钥库文件。** 密钥藏在每篇加密笔记里，随同步走。任意一篇能解开整个库。
-3. **加密笔记用 `.sealed.md`。** 以 `.md` 结尾，任何同步工具都会带上它。
-
-> 📖 加密原理、术语表、架构图见 **[docs/CRYPTO.md](docs/CRYPTO.md)**  
-> 📖 扫码和动态密码的原理见 **[docs/TOTP-PRINCIPLE.md](docs/TOTP-PRINCIPLE.md)**
-
----
-
-## 完整架构总览
-
-```
-┌──────────────────────────────── 人类凭据层 ────────────────────────────────┐
-│                                                                          │
-│   主密码(脑子里)      恢复密钥(纸上)      TOTP种子(手机验证器)             │
-│        │                  │                      │                       │
-│        │ 你设置的          │ randomBytes(20)      │ randomBytes(20)       │
-│        │ 不生成不保存      │ 52 字符              │ 32 字符，扫码给手机    │
-└────────┼──────────────────┼──────────────────────┼───────────────────────┘
-         │                  │                      │
-         │ credentialFor() 加域前缀（sn-pwd| / sn-rec| / sn-totp|）
-         ▼                  ▼                      ▼
-   PBKDF2-HMAC-SHA512 × 600,000 + 每槽独立盐
-         │                  │                      │
-         ▼                  ▼                      ▼
-┌─────────────────────────── 信封层（在每篇笔记的 keys 字段里）──────────────────┐
-│                                                                          │
-│   slot.password     slot.recovery      slot.totp    slot.password-totp   │
-│   ┌──────────┐      ┌──────────┐      ┌────────┐    ┌──────────┐       │
-│   │KEK→DEK盒 │      │KEK→DEK盒 │      │KEK→盒  │    │KEK→DEK盒 │       │
-│   └──────────┘      └──────────┘      └────────┘    └──────────┘       │
-│                                                                          │
-│   任一个盒子解开 → 同一把 DEK（32 字节，永不裸存、换凭据不变）              │
-│   AAD = sealed-note|keyring|vaultId|slot|gen  → 防跨库/跨槽/旧代篡改       │
-└──────────────────────────────┬───────────────────────────────────────────┘
-                               │ HKDF-SHA256（域隔离：整篇 / 行内 / 块）
-                               ▼
-┌────────────────────────── 加密对象层 ────────────────────────────────────┐
-│                                                                          │
-│  ① 整篇隐私笔记 xxx.sealed.md   AES-GCM(子密钥, 全文) + keys 字段          │
-│  ② 普通笔记里的 ```encrypted_txt``` 块    sn1.<base64>                    │
-│  ③ 行内密文 `sn1.xxx`                     Ctrl+点击 → 直接进剪贴板         │
-│                                                                          │
-│  三者共用同一把 DEK 的不同 HKDF 子密钥，每篇/每处独立盐与 IV              │
-└──────────────────────────────┬───────────────────────────────────────────┘
-                               │
-         ┌─────────────────────┼─────────────────────┐
-         ▼                     ▼                     ▼
-┌─────────────────┐  ┌──────────────────┐  ┌────────────────────┐
-│ 磁盘 vault      │  │ 本机存储(不同步)  │  │ 同步到云端          │
-│ .sealed.md 密文 │  │ 设备密钥(加密种子)│  │ Remotely Save/Git/ │
-│ backups/ 历史   │  │ seedRef(种子密文) │  │ Obsidian Sync      │
-│                 │  │ 会话内存种子      │  │ → 只有密文+密盒    │
-└─────────────────┘  └──────────────────┘  └────────────────────┘
-         │                     │                     │
-         └─────────────────────┼─────────────────────┘
-                               ▼
-                  tools/decrypt.html（离线应急，单文件不联网）
-                  粘贴任意一篇 .sealed.md + 密码/恢复密钥 → 出明文
-```
-
-**一句话读图**：三种凭据各自包住同一把 DEK（信封层）→ DEK 派生子密钥加密三种对象（加密对象层）→ 密文和密钥盒子一起存进笔记随同步走；本机只多存一份"加密种子的钥匙"用于免重扫。
-
----
-
-## 为什么是"重置"而不是"找回"
-
-加密产品的核心承诺是"连开发者本人也打不开你的笔记"。而"能帮你找回密码"要求有人知道你的密码。**这两句话不能同时为真。**
-
-所以任何声称能找回密码的本地加密产品，只可能是：密码被存下来了（等于没加密）、用了更弱的密保问题（等于泄露信息）、或有人替你保管密钥（端到端加密失效）。
-
-准确的说法是：**你丢的不是密码，是"包装钥匙的盒子"；钥匙本身（数据密钥）还在。**
-
-```
-主密码   ──PBKDF2──▶ 解开 ┐
-                          ├──▶ 数据密钥（真正的钥匙）──▶ 所有笔记
-恢复密钥 ──PBKDF2──▶ 解开 ┘
-```
-
-- 改密码 = 重新包装一次数据密钥。**笔记内容不重新加密**，一个字节不动。
-- 忘记密码 = 用恢复密钥取出同一把数据密钥，重设密码。
-- 只有恢复密钥也泄露时，才需要轮换数据密钥 + 全库重加密（高级操作）。
-
----
-
-## 密钥在哪里：没有 keyring 文件
-
-**插件目录里没有任何密钥文件。** 没有 `keyring.json`，也不需要配置同步工具去同步什么隐藏目录。
-
-每篇加密笔记（`.sealed.md`）里内嵌一份 `keys` 字段，装着被包裹起来的数据密钥。因为所有笔记用同一把数据密钥的 HKDF 子密钥加密：
-
-> **任意一篇带密钥的笔记，能解开整个保管库**——不只是它自己。
-
-| 情况                  | 结果                  |
-| ------------------- | ------------------- |
-| 换设备 / 重装插件          | ✅ 笔记同步过来，密钥就在       |
-| 同步工具排除了 `.obsidian` | ✅ 完全无影响——密钥不在那里     |
-| 丢了一篇笔记              | ✅ 只丢那篇内容，其他笔记仍有密钥   |
-| 所有笔记都丢了             | ❌ 内容没了（密钥救不了不存在的内容） |
-
-**你唯一需要离线保管的是恢复密钥**（52 字符，初始化时生成一次）。它忘了密码时能重设；它配合任何一篇笔记就能恢复一切。
-
----
-
-## 安装
+## Installation
 
 ```bash
 npm install
 npm run build
-npm run deploy -- "D:/work/obsidian"
+npm run deploy -- "<your-vault>"
 ```
 
-重启 Obsidian，在 **设置 → 第三方插件** 中确认 Sealed Note 已启用。
+Restart Obsidian and enable **Sealed Note** under **Settings → Third-party plugins**.
 
-### 首次使用
+### First run
 
-1. 左侧栏 🔒 图标，或命令面板搜索"新建隐私笔记"
-2. **选择解锁方式**：纯主密码 / 纯动态密码 / 密码 + 动态密码（三者都可独立使用，随时可改）
-3. 按选择设置主密码和/或扫描动态密码二维码
-4. **保存恢复密钥**：复制、下载或打印，勾选确认
-5. 创建第一篇笔记时，密钥随它一起写入
+1. Click the 🔒 ribbon icon, or run "New private note" from the command palette.
+2. **Pick an unlock method**: password only / TOTP only / password + TOTP (all independent, changeable later).
+3. Set the master password and/or scan the TOTP QR code.
+4. **Save the recovery key** — copy, download or print it, then tick the confirmation.
+5. The key is written when you create your first note.
 
-**纯动态密码从第一天就能用**，不需要先设主密码。恢复密钥始终生成，作为最后兜底。
-
-**新笔记建在哪**：和 Obsidian 原生"新建笔记"一样——当前聚焦文件所在的目录；没有聚焦文件就建在保管库根目录。没有额外的文件夹配置项。
-
-**界面语言**：设置里有「界面语言」，可选跟随 Obsidian、English、简体中文。默认跟随 Obsidian。
+TOTP-only works from day one — no master password needed. The recovery key is always generated as the final fallback.
 
 ---
 
-## 用法
+## Usage
 
-### 隐私笔记（整篇加密）
+### Private notes (whole-note encryption)
 
-- 生成 `xxx.sealed.md`，磁盘上只有密文
-- 打开时要求解锁；切走再切回需要重新输入（默认）
-- `Ctrl+S` 或停止输入 1.5 秒后加密保存
-- 以 `.md` 结尾，Remotely Save / Git / 移动端必定同步
+1. Create a note via the ribbon icon or the command palette. The plugin appends `.sealed.md` for you. The key is verified **before** creating anything; if you cancel, no file is created. Disk gets `name.sealed.md` (placeholder note, body is only an invisible ID comment) plus `sealed-data/<ID>.sealedpayload` (real ciphertext from the instant of creation).
+   - **Renaming is safe** — the ID lives in the note body and the ciphertext is keyed by ID, so renaming never breaks decryption. If you accidentally drop the `.sealed.md` suffix, the plugin restores it.
+2. Writing is silent — the note is encrypted from its first character; `Ctrl+S` and autosave are millisecond disk writes, no dialogs or progress bars.
+3. Clicking back onto a private note shows **only a large padlock**; click "Unlock and edit" to prompt for your credential, then continue in the native editor.
+4. Edit it like any note — source mode, live preview, immersive mode, autocomplete and editor commands all work. `Ctrl+S` or ~1.5s of inactivity writes the ciphertext back to the payload. That 1.5s is just autosave throttling (matching Obsidian), not encryption wait time.
+5. **When it locks is decided by the lock policy** (table below). Every lock is the same sequence: encrypt the latest content back to the payload, restore the placeholder body, drop the key from memory.
+6. Opening a note never pops a dialog or steals any pane — the only automatic prompt is when creating a new note with no key in memory (and there's no file yet, so cancel creates nothing).
+7. Inline encrypted blocks in normal notes are unaffected by the padlock — you can edit the whole document without decrypting, and each block unlocks only when you click it.
 
-### 内嵌加密块
+### Lock policy (three tiers, strictest by default)
 
-在普通笔记里：
+Settings → Sealed Note → **When an unlocked note re-locks**:
+
+| Tier | Switch window (browser / other app) | Switch note / tab / settings | **Close this note's tab** | Quit Obsidian |
+| --- | --- | --- | --- | --- |
+| **On any focus loss** (default, most secure) | 🔒 lock | 🔒 lock | 🔒 lock | 🔒 lock |
+| **When the note's tab is closed** | — | — (plaintext stays in the body, coming back continues without a prompt) | 🔒 lock | 🔒 lock |
+| **Once per Obsidian session** | — | — | — | 🔒 lock |
+
+- "Switch window" means Obsidian loses focus (Alt+Tab, switching apps).
+- The cost of "don't lock when switching": at the middle tier, notes whose tab is still open keep plaintext in the `.sealed.md` body (indexed/synced) until you close that tab, lock manually, or quit Obsidian.
+
+> 🔒 **In-place editing, no plaintext copy.** On unlock the plaintext is written straight into `name.sealed.md`'s body; on lock it is re-encrypted to `sealed-data/` and the placeholder is restored. The old `sealed-note-work/` working-copy directory is gone and cleaned at startup — there is no "plaintext file anyone can open".
+>
+> ⚠️ **The one window:** while unlocked, plaintext lives in the `.sealed.md` body and is indexed and synced. This is the inherent cost of in-place editing, the trade-off behind "edit anywhere + lock on policy". Unlock only when editing; the configured policy (default: lock on focus loss) re-seals it for you. If Obsidian crashes while unlocked, the leftover plaintext body is **not silently wiped** at startup — you are prompted, verified once on open, and re-sealed with the real key on first save. Nothing is lost.
+>
+> Sync `.sealed.md` **and** `sealed-data/` — do **not** exclude `sealed-data/`. The payload is `.sealedpayload` (not Markdown, so it never enters Obsidian's index/graph, but Remotely Save / Git still sync it).
+>
+> **Why can't I see `sealed-data/` in Obsidian?** Obsidian's file tree only shows file types it knows; the custom `.sealedpayload` suffix is hidden — the files are on disk (open the folder in your OS file manager) and sync tools still upload them. To show them in the tree: **Settings → Files and links → "Detect all file extensions"**. This is an Obsidian display setting, unrelated to encryption or sync.
+
+**Deleting a note** keeps its ciphertext by default, so sync conflicts or accidental deletes can't destroy it. You can opt into "delete ciphertext with the note" in settings. Orphaned payloads can be cleaned with the "Purge orphan payloads" button (or the same command from the palette).
+
+### Inline encrypted blocks
+
+In a normal note:
 
 ````markdown
 ```encrypted_txt
@@ -155,110 +97,142 @@ sn1.eyJ...
 ```
 ````
 
-- 编辑态是密文，保存后文件里也是密文
-- 阅读态显示 `🔒 已加密内容`，点击解密（只在屏幕上，不改文件）
-- 别名：`txt_encrypted`、`sealed`
+- Editing state is ciphertext; the saved file is ciphertext too.
+- Reading state shows `🔒 Encrypted content`; click to decrypt (on screen only, file untouched).
+- Aliases: `txt_encrypted`, `sealed`.
 
-### 行内密文
+### Inline ciphertext
 
-选中文字 → 右键 → 加密所选内容 → 变成 `` `sn1.xxx` ``，阅读态显示为 `🔒 密文`。  
-按住 `Ctrl` 点击：直接复制到剪贴板，**不显示在屏幕上**。
+Select text → right-click → **Encrypt selection** → becomes `` `sn1.xxx` ``, shown as `🔒` in reading mode.
+`Ctrl`-click copies it straight to the clipboard **without displaying it**.
 
-### 右键菜单
+### Context menus
 
-| 场景      | 菜单项                  |
-| ------- | -------------------- |
-| 编辑器选中文字 | 加密所选 / 解密所选 / 解密到剪贴板 |
-| 文件树加密笔记 | 解锁 / 锁定 / 创建明文副本     |
-
----
-
-## 三种解锁方式
-
-| 方式            | 输入                | 换设备后                  |
-| ------------- | ----------------- | --------------------- |
-| **主密码**       | 你设置的密码，不存盘        | 可用                    |
-| **密码 + 动态密码** | 主密码 + 6 位码（推荐，默认） | 密码 + 恢复密钥可进入          |
-| **纯主密码**      | 主密码               | 可用                    |
-| **纯动态密码**     | 6 位码              | 验证器导出 otpauth 链接，导入即可 |
-| **恢复密钥**      | 52 字符 Base32，离线保存 | 始终可用                  |
-
-设置动态密码时，插件**本地**生成二维码（绝不联网），用 Authy / Google Authenticator / 1Password 扫码即可接入。换电脑：从验证器导出 otpauth 链接，用恢复密钥解锁后到设置页「恢复本机种子缓存」粘贴。
-
-**密钥材料是验证器里的 160 位种子，不是每 30 秒变化的 6 位码**。6 位码只用来证明你持有验证器；明文种子不写盘、不进笔记、不上传。种子用设备密钥加密后存在本机（不同步），所以**同一台设备重启后只输 6 位码即可，不用重新扫码**。只有换新设备时才需要粘贴一次 otpauth 链接。多台手机扫同一个二维码会得到相同种子，因此显示的 6 位码也相同。
-
-> 📖 详见 **[docs/TOTP-PRINCIPLE.md 第 11 节](docs/TOTP-PRINCIPLE.md#11-种子在插件的哪里多设备一致吗)**
+| Where | Menu items |
+| --- | --- |
+| Source-mode editor (any note) | Decrypt document / Encrypt selection / Decrypt selection / Decrypt selection to clipboard |
+| File tree → **folder** | New private note (created in that folder, like native "New note") |
+| File tree (private or plain note) | Decrypt document (private note makes a plaintext copy; plain note decrypts all blocks in place) |
+| File tree (private note) | Reclaim a deleted annotation (recovery key) / Unlock / Lock |
+| Reading-mode block / pill | Click → unlock dialog per configured method → show original |
 
 ---
 
-## 改密码时会发生什么
+## Unlock methods
 
-**不重新加密笔记内容。** 数据是 AES-256-GCM 密文，数据密钥没变，`data` 字段一个字节不动。
+Pick one mode at setup (changeable later). The recovery key is always listed as a fallback, and the dialog only shows the channels that actually exist in the current mode:
+
+| Mode | You enter | New device / after restart | Notes |
+| --- | --- | --- | --- |
+| **Password only** | Your password (never stored, only used in derivation) | Works immediately | Simplest |
+| **TOTP only** | The 6-digit code from your authenticator | Authenticator travels with you; the device seed is stored encrypted locally (not synced), so no re-scan needed | New computer: enter with the recovery key → Settings → "Restore local seed cache", paste the otpauth link |
+| **Password + TOTP** | Password + 6-digit code (both required) | Strict two-factor: no password-only channel exists, no bypass tab in the dialog. Seed restores automatically after restart | New device: recovery key → restore seed from the otpauth link |
+| **Recovery key** | 52 chars (auto-inserts `-`, case/space insensitive) | Always available | The last offline door; if you misplace it, regenerate a copy in Settings while you still have the password |
+
+**Rate-limited, never slower over time:** 5 free attempts, then exponential backoff 1s → 2s → 4s → … capped at 60s; **any success resets immediately**. Empty submits don't count or consume attempts. The counter lives in the key copy, so it survives device changes.
+
+> **Honest note on "password + TOTP":** it is strict two-factor — setup no longer creates a standalone password slot, and the dialog has no password-only tab, only password + code or the recovery key. Vaults from early versions still carry that single-password channel: the settings page shows a "strict two-factor" section with a "close the password-only door" button (it also refreshes key copies in all notes; no re-scan needed).
+
+TOTP QR codes are generated **locally** (never networked) for Authy / Google Authenticator / 1Password.
+
+**The key material is the 160-bit seed in your authenticator, not the 6-digit code.** The code only proves you hold the authenticator; the seed is never written to disk, notes or the network. It is stored encrypted by a device key (not synced), so **the same device only needs the 6-digit code after a restart — no re-scan**. Only a new device needs the otpauth link once. Two phones scanning the same QR get the same seed, so they show the same code.
+
+> 📖 See **[docs/TOTP-PRINCIPLE.md §11](docs/TOTP-PRINCIPLE.md#11-种子在插件的哪里多设备一致吗)** for where the seed lives and multi-device consistency.
+
+### What each unlock error means
+
+Errors are split by **actual cause**, never lumped into a generic "wrong password":
+
+| You see | Actual cause | Next step |
+| --- | --- | --- |
+| TOTP code wrong | The code itself is wrong (changes every 30s, ±1 step tolerance) | Wait for a new code; if it fails every time, the local seed and authenticator differ — unlock with the recovery key and re-bind in Settings |
+| Code right, but doesn't match the vault key | Seed isn't the bound one, or the password changed | Unlock once with the recovery key, re-bind TOTP in Settings |
+| Code right, but password doesn't match | In combined mode, password or seed is wrong | No password-only tab to try; confirm both, else reset both with the recovery key |
+| Password wrong | The password is wrong | Unlock with the recovery key and reset the password in Settings |
+| Recovery key wrong | Copied wrong, or not this vault's key | Copy the grouped characters verbatim (spaces and dashes don't matter); if the backup is out of reach, use the password or an already-unlocked device |
+| "Enter a 6-digit code" | The field is empty | Fill it in — empty submits don't consume attempts |
+| No usable TOTP seed on this device | New computer, or local app data cleared | Unlock with the recovery key → Settings → "Restore local seed cache", paste the otpauth link (same seed, phone untouched); the dialog stays open so you can do it in place |
+
+Don't confuse three notices: **in the dialog** = can't get into the keyring; **top-right** "can't decrypt this note…" = in the keyring but this note's ciphertext won't open (recover from backup/file history); **top-right** raw error text = disk write failure (this path is fixed; it shouldn't appear again).
+
+---
+
+## What happens when you change the password
+
+**Note content is not re-encrypted.** Data is AES-256-GCM ciphertext and the data key didn't change; the `data` field is untouched byte for byte.
 
 ```
-批量更新每篇加密笔记的 keys 字段
-  → 只改这几行 JSON，data/salt/iv 原样拷贝
-  → PBKDF2 只跑一次
-  → 只识别加密笔记，普通 Markdown 一个都不碰
-  → 可中断续跑，已更新的自动跳过
+Update the keys field of every encrypted note
+  → only those JSON lines change, data/salt/iv are copied verbatim
+  → PBKDF2 runs once
+  → only encrypted notes are touched, no plain Markdown
+  → resumable; already-updated notes are skipped
 ```
 
 ---
 
-## 离线解密工具
+## Offline decryption tool
 
-`tools/decrypt.html` 是单文件、无依赖、不联网的应急工具。**插件运行时不使用它。**
+`tools/decrypt.html` is a single file, dependency-free, no network. **The plugin never uses it.**
 
-1. 浏览器打开（双击即可）
-2. 粘贴一篇 `.sealed.md` 笔记全文
-3. 输入主密码**或**恢复密钥
+1. Open it in a browser (double-click).
+2. Paste a whole `.sealed.md` note.
+3. Enter the master password **or** the recovery key.
 
-密钥就在笔记自己里面，通常不需要额外文件。用途：验证备份是否还能打开、在没装 Obsidian 的机器上解密。
+The key is inside the note itself, so usually no extra file is needed. Use it to verify a backup still opens, or to decrypt on a machine without Obsidian.
 
-有专门的兼容性测试把真正的 HTML 抽出来跑，确保它解出的结果和插件一致。
+A compatibility test runs the actual HTML to make sure it produces the same result as the plugin.
 
-**安全提醒**：只使用你自己仓库里的这个文件。别人发给你的版本可能被改过。
-
----
-
-## 安全边界
-
-### 能防
-
-- 云同步泄漏（坚果云/iCloud/Git 只看到密文）
-- 电脑被翻，但 Obsidian 已锁定
-- 拿到 vault + 知道密码，但没有你的手机（若开了动态密码）
-- 离线爆破被 600,000 次 PBKDF2 拖慢
-
-### 防不住（重要）
-
-- **解锁状态下**：明文在内存和渲染层，可被截屏、录屏、剪贴板、恶意插件读取
-- **文件名、大小、数量、修改时间**
-- **键盘记录器**、被入侵的操作系统
-- **弱密码 + 拿到笔记** → 离线爆破（有强度提示，但不强制）
-- **恢复密钥拍照存相册** = 把钥匙贴在门上
-
-### 关于文件名与索引
-
-`.sealed.md` 的文件名是明文，且密文会进 Obsidian 搜索索引。**但索引里是密文 JSON，没有任何明文。** 敏感场景请用中性文件名。
+**Security:** only use the copy in your own repo. A version someone sent you may have been tampered with.
 
 ---
 
-## 备份建议
+## Security boundary
 
-1. **恢复密钥** → 打印，放实体安全处，不要和 vault 放同一个同步盘
-2. **保管库本身** → 你现有的同步/备份方案（笔记自带密钥，同步即备份）
-3. 插件 `backups/` 目录保留最近 5 份密文历史
+### What it protects against
 
-**卸载前**：先解密所有笔记。卸载后 `.sealed.md` 没有插件打不开，可用 `tools/decrypt.html` 救。
+- Cloud sync leakage (Nutstore / iCloud / Git only ever see ciphertext)
+- A computer with Obsidian locked
+- Someone with the vault + password but not your phone (with TOTP: combined or TOTP-only are strict channels — a lone password gets you nowhere)
+- Offline brute force slowed by 600,000 PBKDF2 iterations
+
+### What it does not protect against (important)
+
+- **While unlocked:** plaintext is in memory and the render layer — readable via screenshot, screen recording, clipboard, or a malicious plugin
+- **File names, sizes, counts, modification times**
+- **Keyloggers**, a compromised OS
+- **Weak password + the note** → offline brute force (strength hint exists, not enforced)
+- **Recovery key photographed into your photo library** = taping the key to your door
+
+### File names and indexing
+
+`.sealed.md` file names are plaintext and enter Obsidian's index, but the body is only an ID comment — **no plaintext or ciphertext**. The real ciphertext is in `sealed-data/*.sealedpayload` (not Markdown, so not in search/graph), yet Remotely Save / Git still sync it. Use neutral names in sensitive setups.
+
+### Recovering a deleted annotation
+
+`<!-- sealed-note:ref=<ID> -->` is the only clue linking a note to its ciphertext; if it's deleted the plugin can't know which payload belongs to the note. Recovery, in recommended order:
+
+1. **Version control (best):** Git or a history-capable sync tool restores the `.sealed.md` to before the deletion — lossless and automatic.
+2. **Recovery-key reclaim:** on the annotation-less private note, run "Reclaim a deleted annotation (recovery key)" from the palette or context menu → enter the recovery key → the plugin lists every payload it can open (with title and preview) → pick the one for this note → it writes the body back, creates a new annotation and a new payload. The original ciphertext is kept, nothing is deleted. Note: the recovery key opens payloads but **can't tell ownership** — you must pick.
+3. If the payload file is gone too (even `sealed-data/` was cleared), the recovery key is powerless — restore the files from history.
 
 ---
 
-## 兼容性
+## Backup
 
-Obsidian 1.5.0+，桌面端与移动端（只依赖 Web Crypto，无 Node API）。  
-与 Obsidian Sync、Remotely Save、Git 等同步方案兼容。
+1. **Recovery key** → print it, store it somewhere physically safe, not on the same sync drive as the vault.
+2. **The vault itself** → your existing sync/backup scheme (notes carry their key; sync *is* backup).
+3. The plugin's `backups/` keeps the last 5 ciphertext generations.
 
-## 许可
+**Before uninstalling:** decrypt all notes first. After uninstall `.sealed.md` can't be opened by the plugin — `tools/decrypt.html` can rescue them.
+
+---
+
+## Compatibility
+
+Obsidian 1.5.0+, desktop and mobile (Web Crypto only, no Node API).
+Works with Obsidian Sync, Remotely Save, Git and similar sync schemes.
+
+## License
 
 MIT
