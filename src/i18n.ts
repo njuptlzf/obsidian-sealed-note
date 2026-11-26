@@ -41,16 +41,13 @@ const en: Record<string, string> = {
   "cmd.recovery.name": "View / regenerate recovery key",
   "cmd.rebuild.name": "Rebuild keyring from a note (when lost)",
   "cmd.refreshCopies.name": "Refresh key copies in all notes",
-  "cmd.migrate.name": "Move note envelopes into separate payload files",
   "cmd.totp.name": "Configure two-factor authentication",
   "cmd.settings.name": "Open encryption settings",
 
   // ---- notices ----
   "notice.created": "Private note created. Only ciphertext is written to disk.",
   "notice.suffixRestored": "Kept the .sealed.md suffix so this stays a private note: {name}",
-  "notice.migrated": "Migration done: {n} note(s) moved to single-file format, {skip} already current, {fail} failed.",
   "notice.badEnvelopeRepaired": "This file was not a valid ciphertext envelope. Its current content was encrypted and saved; the old bytes were backed up.",
-  "notice.payloadMissingShort": "The old sidecar ciphertext is missing; this note cannot be migrated.",
   "notice.locked": "Locked",
   "notice.lockedCount": "Locked {n} note(s)",
   "notice.noUnlocked": "No notes are currently unlocked",
@@ -135,6 +132,8 @@ const en: Record<string, string> = {
   "recovery.title": "Save your recovery key",
   "recovery.warning":
     "This is the only thing that can rescue your notes. If you forget the password, it resets it - the password itself cannot be recovered by anything.",
+  "recovery.shareWarning":
+    "The recovery key can reset your unlock method (master password, TOTP, or both). Anyone who has it can change your unlock method, so never forward or share it with anyone - not even someone claiming to be support.",
   "recovery.copy": "Copy",
   "recovery.download": "Download as text file",
   "recovery.ack":
@@ -182,6 +181,11 @@ const en: Record<string, string> = {
   "settings.recoveryDesc": "Configured - make sure it is stored offline",
   "settings.recoveryMissing": "Not configured - generate one now",
   "settings.regenerate": "Regenerate",
+  "settings.setRecovery": "Set recovery key",
+  "settings.resetRecovery": "Reset recovery key",
+  "settings.modeSwitch": "Decryption mode",
+  "settings.modeNoCredential":
+    "No configured credential is available on this device. Unlock with the recovery key first, then retry.",
   "settings.totp": "Unlock method",
   "settings.totpDesc": "Current mode: {mode}. The seed lives only in your authenticator app.",
   "settings.totpOff": "Not enabled. Current mode: {mode}",
@@ -323,16 +327,13 @@ const zh: Record<string, string> = {
   "cmd.recovery.name": "查看/重新生成恢复密钥",
   "cmd.rebuild.name": "从加密笔记恢复密钥库（密钥库丢失时用）",
   "cmd.refreshCopies.name": "刷新所有加密笔记里的密钥副本",
-  "cmd.migrate.name": "把旧笔记的密钥/密文迁移到独立文件",
   "cmd.totp.name": "设置动态密码（两步验证）",
   "cmd.settings.name": "打开加密设置",
 
   // ---- notices ----
   "notice.created": "隐私笔记已创建。保存后磁盘上只有密文。",
   "notice.suffixRestored": "已自动补回 .sealed.md 后缀以保持隐私笔记可解密：{name}",
-  "notice.migrated": "迁移完成：{n} 篇已转为单文件格式，{skip} 篇无需迁移，{fail} 篇失败。",
   "notice.badEnvelopeRepaired": "这个文件不是有效的密文信封。已把当前内容加密保存，旧文件已备份。",
-  "notice.payloadMissingShort": "旧的独立密文文件已丢失，这篇笔记无法迁移。",
   "notice.locked": "已锁定",
   "notice.lockedCount": "已锁定 {n} 篇笔记",
   "notice.noUnlocked": "当前没有已解锁的笔记",
@@ -416,6 +417,8 @@ const zh: Record<string, string> = {
   "recovery.title": "保存你的恢复密钥",
   "recovery.warning":
     "这是唯一能救回你笔记的东西。忘记主密码时用它重设——密码本身无法找回，任何工具都做不到。",
+  "recovery.shareWarning":
+    "恢复密钥可以用来重置解锁方式（主密码、动态密码或两者）。任何拿到它的人都能改掉你的解锁方式，所以绝对不要转发或分享给任何人——包括自称客服的人。",
   "recovery.copy": "复制",
   "recovery.download": "下载为文本文件",
   "recovery.ack": "我已把恢复密钥保存在离线的地方，并理解丢失它和密码将无法恢复数据",
@@ -462,6 +465,10 @@ const zh: Record<string, string> = {
   "settings.recoveryDesc": "已设置 · 请确认它在离线的地方",
   "settings.recoveryMissing": "未设置——强烈建议立刻生成",
   "settings.regenerate": "重新生成",
+  "settings.setRecovery": "设置恢复密钥",
+  "settings.resetRecovery": "重置恢复密钥",
+  "settings.modeSwitch": "解密模式",
+  "settings.modeNoCredential": "本机没有可用的已配置凭据。请先用恢复密钥解锁，再重试。",
   "settings.totp": "解锁方式",
   "settings.totpDesc": "当前模式：{mode}。种子只保存在你的验证器 App 里。",
   "settings.totpOff": "未启用。当前模式：{mode}",

@@ -56,8 +56,6 @@ export class NoteKeyringStore {
       if (!this.notes.isKeySourcePath(file.path)) continue;
       try {
         // Unlocked notes hold plaintext, not an envelope: never a key source.
-        // v1 sidecar notes are represented by their payload, so skip the note
-        // itself and let the payload be counted exactly once.
         if (this.notes.isSealedPath(file.path)) {
           const noteRaw = await this.app.vault.read(file).catch(() => "");
           if (noteBodyState(noteRaw) !== "sealed") continue;

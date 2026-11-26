@@ -308,6 +308,10 @@ export function passwordScore(password: string): number {
 export class RecoveryKeyModal extends Modal {
   private acknowledged = false;
   private done = false;
+  /** Only an explicit close (title-bar × or 完成) may dismiss this modal. */
+  private dismissalAllowed = false;
+  private closed = false;
+  private settled = false;
 
   constructor(
     app: App,
@@ -319,7 +323,57 @@ export class RecoveryKeyModal extends Modal {
     super(app);
   }
 
+  /**
+   * Obsidian routes backdrop clicks and Escape through close(). Neither may be
+   * allowed to make the one-time recovery key vanish behind the user, so those
+   * calls are ignored here. The title-bar × is marked as explicit in the
+   * capture-phase listener installed in onOpen(), and 完成 goes through
+   * acknowledge().
+   */
+  close(): void {
+    if (this.closed || !this.dismissalAllowed) return;
+    this.closed = true;
+    super.close();
+  }
+
+  /** Resolve the setup promise exactly once, whichever explicit path got here. */
+  private settle(saved: boolean): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.resolve(saved);
+  }
+
+  /** Explicit, non-saving dismissal (the title-bar ×). */
+  dismissByCloseButton(): void {
+    this.dismissalAllowed = true;
+    this.settle(false);
+    this.close();
+  }
+
+  /** The 完成 button: the user confirmed they saved the key. */
+  acknowledge(): void {
+    if (this.done) return;
+    this.done = true;
+    this.dismissalAllowed = true;
+    this.settle(true);
+    this.close();
+  }
+
   onOpen(): void {
+    // Obsidian's own × lives in the title bar and calls close(). Tag that click
+    // as explicit before Obsidian's bubble handler runs; every other close
+    // source (backdrop, Escape) leaves dismissalAllowed false and is ignored.
+    this.modalEl?.addEventListener(
+      "click",
+      (event) => {
+        const target = event.target as HTMLElement | null;
+        if (target && typeof target.closest === "function" && target.closest(".modal-close-button")) {
+          this.dismissalAllowed = true;
+        }
+      },
+      true,
+    );
+
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("sealed-modal", "sealed-recovery");
@@ -330,6 +384,10 @@ export class RecoveryKeyModal extends Modal {
       cls: "sealed-warning",
       text:
         t("recovery.warning"),
+    });
+    contentEl.createEl("p", {
+      cls: "sealed-warning",
+      text: t("recovery.shareWarning"),
     });
 
     const box = contentEl.createDiv({ cls: "sealed-key-box" });
@@ -378,16 +436,14 @@ export class RecoveryKeyModal extends Modal {
     const foot = contentEl.createDiv({ cls: "sealed-actions" });
     const ok = foot.createEl("button", { text: t("recovery.done"), cls: "mod-cta" });
     ok.disabled = true;
-    ok.addEventListener("click", () => {
-      this.done = true;
-      this.resolve(true);
-      this.close();
-    });
+    ok.addEventListener("click", () => this.acknowledge());
   }
 
   onClose(): void {
     this.contentEl.empty();
-    if (!this.done) this.resolve(false);
+    // Safety net for a close Obsidian initiates outside close() (unload, etc).
+    // Normal dismissal already settled via acknowledge()/dismissByCloseButton().
+    this.settle(false);
   }
 }
 

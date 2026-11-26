@@ -25,7 +25,7 @@ import {
   removeSlot,
 } from "../core/keyring";
 import { NoteKeyringStore } from "../storage/note-keyring-store";
-import { ProviderId, UnlockProvider, UnlockAttempt, providersAvailable, needsCode } from "../core/providers";
+import { ProviderId, UnlockProvider, UnlockAttempt, providersAvailable, needsCode, getProvider } from "../core/providers";
 import { SessionStore } from "../core/session";
 import { log } from "../util/log";
 import { t } from "../i18n";
@@ -139,6 +139,52 @@ export class UnlockService {
       available.find((p) => p.id === request?.preferred) ?? available[0];
 
     return this.interactiveUnlock(filePath, kr, start, available, request?.subject ?? "", request?.verb);
+  }
+
+  /**
+   * The vault's configured unlock credential, used as the DEFAULT tab for a
+   * sensitive settings action:
+   *   password+totp -> both secrets, totp -> code, password -> master password.
+   * This is a preference, not a restriction: the recovery key stays available
+   * as an alternative. Returns null when only a recovery slot exists.
+   */
+  providerForMode(kr: KeyringData): UnlockProvider | null {
+    const id: ProviderId | null =
+      kr.totp.enabled && kr.slots[SLOT_PASSWORD_TOTP]
+        ? "password+totp"
+        : kr.slots[SLOT_PASSWORD]
+          ? "password"
+          : kr.totp.enabled && kr.slots[SLOT_TOTP]
+            ? "totp"
+            : null;
+    return id ? getProvider(id) : null;
+  }
+
+  /**
+   * Re-authenticate for a sensitive settings action (recovery key reset, mode
+   * change). Ignores any cached session so a stale unlock cannot authorize a
+   * credential rotation.
+   *
+   * The configured mode is the default tab, but the recovery key is ALWAYS
+   * offered: rotating a recovery key is precisely what you do when you suspect
+   * it leaked, and "use the recovery key to change the unlock method" is its
+   * documented purpose. Excluding it would make the reset unreachable in the
+   * one case it exists for.
+   */
+  async reauthForSettings(subject: string): Promise<{ dek: Uint8Array; kr: KeyringData } | null> {
+    const kr = await this.requireKeyring();
+    const available = providersAvailable(kr);
+    if (available.length === 0) return null;
+    const start = this.providerForMode(kr) ?? available[0];
+    const sentinel = `__settings__/${subject}`;
+    this.sessions.lock(sentinel);
+    const dek = await this.interactiveUnlock(sentinel, kr, start, available, subject, "unlock");
+    if (!dek) return null;
+    // interactiveUnlock caches a session copy under the sentinel. A settings
+    // re-auth has no note to keep unlocked, so drop that copy now; the returned
+    // DEK is the original array and stays valid for the caller.
+    this.sessions.lock(sentinel);
+    return { dek, kr };
   }
 
   private async interactiveUnlock(
@@ -466,6 +512,11 @@ export class UnlockService {
   /** Is a usable seed available right now (session memory or this device's seal)? */
   async hasLocalSeed(kr: KeyringData): Promise<boolean> {
     return (await this.localSeed(kr)) !== null;
+  }
+
+  /** Current seed from session memory or this device's seal, if any. */
+  async currentSeed(kr: KeyringData): Promise<string | null> {
+    return this.localSeed(kr);
   }
 
   /** Read the seed from session memory, else unseal it from this device. */

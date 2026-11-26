@@ -116,7 +116,7 @@
     恢复密钥走 <code>recovery</code> slot，先做 Base32 规范化（大写、去除非 A-Z2-7 字符）。
   </p>
   <p>
-    <strong>笔记</strong>：新格式的 <code>.sealed.md</code> 只有占位文字和 <code>&lt;!-- sealed-note:ref=ID --&gt;</code>，信封在 <code>sealed-data/ID.sealedpayload</code>（原始 JSON，旧版注释/裸 JSON 笔记同样可解），形如 <code>{"format":"sealed-note/note/1","kid","salt","iv","data"}</code>；
+    <strong>笔记</strong>：<code>.sealed.md</code> 的正文本身就是信封（HTML 注释包裹的 JSON，裸 JSON 也可解），形如 <code>{"format":"sealed-note/note/1","kid","salt","iv","data"}</code>；
     文件密钥 = <code>HKDF-SHA256(DEK, salt, "sealed-note/note/v1")</code>，
     AAD 为 <code>sealed-note|note|&lt;vaultId&gt;</code>，密文与 16 字节 tag 拼接后 Base64。
   </p>
@@ -259,12 +259,7 @@ async function unwrapDekFromKeyring(keyring, secret) {
 /* ------------------------------------------------------------------ */
 
 // Notes are Markdown files with the JSON envelope inside an HTML comment, so
-// a rendered view never exposes the wrapped keys. Bare JSON from older versions
-// is accepted as well.
-function isPayloadRefNote(text) {
-  return /<!--\s*sealed-note:ref=[A-Za-z0-9-]+\s*-->/.test(text || "");
-}
-
+// a rendered view never exposes the wrapped keys. Bare JSON is accepted as well.
 function parseNoteEnvelopeText(text) {
   const raw = (text || "").trim();
   if (!raw) return null;
@@ -397,15 +392,8 @@ $("run").addEventListener("click", async () => {
   say("处理中…（PBKDF2 需要一点时间）");
 
   try {
-    // Parse the pasted content. A whole note carries its own `keys` field, so
-    // in the common case no second file is needed at all.
-    // New notes contain only a placeholder and an opaque ID; the envelope is
-    // in a sidecar payload file. Ask for that file instead of decoding noise.
-    if (isPayloadRefNote(text) && !parseNoteEnvelopeText(text)) {
-      say("这是占位笔记：密钥和密文在 sealed-data/ 下同 ID 的 .sealedpayload 文件里。请把该文件选到下面，或把它的内容粘贴进来。", "err");
-      return;
-    }
-
+    // Parse the pasted content. The note body IS the envelope, including its
+    // own `keys` field, so no second file is ever needed.
     const parsed = parseNoteEnvelopeText(text);
 
     const pastedCopy = parsed && parsed.keys ? parsed.keys : null;

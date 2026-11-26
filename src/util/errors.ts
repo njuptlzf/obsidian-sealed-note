@@ -20,12 +20,6 @@ export const Err = {
   cancelled: () => new SealedNoteError("E_CANCELLED", "已取消"),
   badEnvelope: (path?: string) =>
     new SealedNoteError("E_BAD_ENVELOPE", "文件不是有效的加密笔记，或已被其他工具破坏", path),
-  payloadMissing: (path?: string) =>
-    new SealedNoteError(
-      "E_PAYLOAD_MISSING",
-      `找不到这篇笔记对应的密文文件：${path ?? "未知路径"}。可能尚未同步完成、被移动或删除。`,
-      path,
-    ),
   keyringMissing: () =>
     new SealedNoteError("E_KEYRING_MISSING", "找不到密钥库，无法读取加密笔记"),
   vaultMismatch: () =>

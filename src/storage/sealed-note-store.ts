@@ -1,14 +1,11 @@
 /**
  * Reading and writing private notes.
  *
- * v2 format (this version): the .sealed.md file body IS the encrypted note
- * envelope (an HTML comment wrapping JSON). Renaming, moving or syncing the
- * note can never separate it from its ciphertext: there is no sidecar file and
- * no reference annotation. Unlocking replaces the body with bare plaintext;
- * locking replaces it with the envelope again.
- *
- * v1 sidecar format (ref annotation + sealed-data/*.sealedpayload) is READABLE
- * for migration only. The `migrateToSingleFile` command converts it in place.
+ * The .sealed.md file body IS the encrypted note envelope (an HTML comment
+ * wrapping JSON). Renaming, moving or syncing the note can never separate it
+ * from its ciphertext: there is no sidecar file and no reference annotation.
+ * Unlocking replaces the body with bare plaintext; locking replaces it with
+ * the envelope again.
  *
  * Invariants: cipher bytes are backed up before an overwrite, plaintext never
  * is, and body writes go through vault.modify so the Obsidian editor buffer
@@ -17,35 +14,24 @@
 
 import { App, TFile, normalizePath } from "obsidian";
 import {
-  PAYLOAD_EXTENSION,
   KeyCopy,
   NoteEnvelope,
   noteBodyState,
   openNote,
   parseNoteEnvelope,
-  parseNoteRef,
-  parseRevealedBody,
   sealNote,
   serializeNoteEnvelope,
-  serializeNotePayload,
   serializeNotePlain,
 } from "../core/format";
 import { KeyringData, keyCopyFromKeyringData } from "../core/keyring";
-import { randomUuid } from "../core/crypto";
-import { Err, describeError } from "../util/errors";
+import { Err } from "../util/errors";
 import { log } from "../util/log";
 
 export const SEALED_EXTENSION = "sealed.md";
-export const DEFAULT_PAYLOAD_DIR = "sealed-data";
 const KEEP_BACKUPS = 5;
 
 export interface EnvelopeSource {
   envelope: NoteEnvelope;
-  /** old sidecar file, only present while migrating a v1 note */
-  payload?: TFile;
-  /** true when the note is still in the old sidecar format */
-  legacy: boolean;
-  ref?: string;
 }
 
 /**
@@ -61,11 +47,7 @@ export class SealedNoteStore {
   constructor(
     private readonly app: App,
     private readonly pluginDir: string,
-    private readonly getPayloadDir: () => string = () => DEFAULT_PAYLOAD_DIR,
   ) {}
-
-  /** Retained so existing callers keep working; v2 has no annotation hint. */
-  setPlaceholderHint(_text: string): void {}
 
   /* ---------------- paths ------------------------------------------------- */
 
@@ -73,25 +55,9 @@ export class SealedNoteStore {
     return path.toLowerCase().endsWith(`.${SEALED_EXTENSION}`);
   }
 
-  isPayloadPath(path: string): boolean {
-    return path.toLowerCase().endsWith(PAYLOAD_EXTENSION);
-  }
-
-  /** Notes and payloads both carry key copies; both are key sources. */
+  /** Every locked note carries a key copy in its own body. */
   isKeySourcePath(path: string): boolean {
-    return this.isPayloadPath(path) || this.isSealedPath(path);
-  }
-
-  payloadDir(): string {
-    return normalizePath(this.getPayloadDir().trim() || DEFAULT_PAYLOAD_DIR);
-  }
-
-  payloadPath(ref: string): string {
-    return normalizePath(`${this.payloadDir()}/${ref}${PAYLOAD_EXTENSION}`);
-  }
-
-  private getPayloadFile(ref: string): TFile | null {
-    return (this.app.vault.getAbstractFileByPath(this.payloadPath(ref)) as TFile) ?? null;
+    return this.isSealedPath(path);
   }
 
   withExtension(path: string): string {
@@ -130,43 +96,19 @@ export class SealedNoteStore {
     return this.app.vault.read(file);
   }
 
-  /** Envelope from the note body itself; v1 sidecars stay readable for migration. */
+  /** Envelope from the note body itself. No sidecar is ever consulted. */
   async tryReadEnvelope(file: TFile): Promise<NoteEnvelope | null> {
     const raw = await this.app.vault.read(file).catch(() => "");
-    const state = noteBodyState(raw);
-    if (state === "sealed") return parseNoteEnvelope(raw);
-    if (state === "sidecar-ref") {
-      const payload = this.getPayloadFile(parseNoteRef(raw)!);
-      if (!payload) return null;
-      return parseNoteEnvelope(await this.app.vault.read(payload));
-    }
-    if (this.isPayloadPath(file.path)) return parseNoteEnvelope(raw);
-    return null;
+    if (noteBodyState(raw) !== "sealed") return null;
+    return parseNoteEnvelope(raw);
   }
 
   async resolveEnvelope(file: TFile): Promise<EnvelopeSource> {
     const raw = await this.readCiphertext(file);
-    const state = noteBodyState(raw);
-    if (state === "sealed") {
-      const envelope = parseNoteEnvelope(raw);
-      if (!envelope) throw Err.badEnvelope(file.path);
-      return { envelope, legacy: false };
-    }
-    if (state === "sidecar-ref") {
-      const ref = parseNoteRef(raw)!;
-      const path = this.payloadPath(ref);
-      const payload = this.getPayloadFile(ref);
-      if (!payload) throw Err.payloadMissing(path);
-      const envelope = parseNoteEnvelope(await this.app.vault.read(payload));
-      if (!envelope) throw Err.badEnvelope(path);
-      return { envelope, payload, legacy: true, ref };
-    }
-    if (this.isPayloadPath(file.path)) {
-      const envelope = parseNoteEnvelope(raw);
-      if (!envelope) throw Err.badEnvelope(file.path);
-      return { envelope, legacy: true };
-    }
-    throw Err.badEnvelope(file.path);
+    if (noteBodyState(raw) !== "sealed") throw Err.badEnvelope(file.path);
+    const envelope = parseNoteEnvelope(raw);
+    if (!envelope) throw Err.badEnvelope(file.path);
+    return { envelope };
   }
 
   /** Decrypt a note. Throws if the envelope is missing or damaged. */
@@ -217,35 +159,6 @@ export class SealedNoteStore {
     });
   }
 
-  /**
-   * A pre-key-copy note whose envelope sits bare in the body is already v2
-   * shaped: just re-serialise it with the comment wrapper. No sidecar involved.
-   */
-  async migrateLegacy(file: TFile, envelope?: NoteEnvelope): Promise<boolean> {
-    const raw = await this.app.vault.read(file);
-    if (noteBodyState(raw) !== "revealed") return false;
-    const env = envelope ?? parseNoteEnvelope(raw);
-    if (!env) throw Err.badEnvelope(file.path);
-    await this.chainWrite(file.path, () => this.app.vault.modify(file, serializeNoteEnvelope(env)));
-    this.log.info("note_migrated", { path: file.path });
-    return true;
-  }
-
-  /** v1 migration helper: read-only source payload; never created by v2. */
-  async readPayload(ref: string): Promise<{ file: TFile; envelope: NoteEnvelope } | null> {
-    const payload = this.getPayloadFile(ref);
-    if (!payload) return null;
-    const envelope = parseNoteEnvelope(await this.app.vault.read(payload));
-    return envelope ? { file: payload, envelope } : null;
-  }
-
-  /** v1 migration: replace a ref annotation body with the envelope body. */
-  async replaceBodyWithEnvelope(file: TFile, envelope: NoteEnvelope): Promise<void> {
-    await this.chainWrite(file.path, () =>
-      this.app.vault.modify(file, serializeNoteEnvelope(envelope)),
-    );
-  }
-
   private async ensureFolder(filePath: string): Promise<void> {
     const dir = filePath.split("/").slice(0, -1).join("/");
     if (dir && !(await this.app.vault.adapter.exists(dir))) {
@@ -263,7 +176,6 @@ export class SealedNoteStore {
   /** True when a note body currently holds revealed plaintext (unlocked). */
   isRevealedText(text: string): boolean {
     const state = noteBodyState(text);
-    // A v1 placeholder is a locked note too; only real plaintext counts.
     return state === "revealed" || state === "empty";
   }
 
@@ -301,20 +213,10 @@ export class SealedNoteStore {
 
   /* ---------------- lifecycle -------------------------------------------- */
 
-  /** v1 migration only: remove a sidecar payload after its envelope was moved. */
-  async deletePayload(ref: string): Promise<boolean> {
-    const path = this.payloadPath(ref);
-    if (!(await this.app.vault.adapter.exists(path))) return false;
-    await this.app.vault.adapter.remove(path);
-    this.log.info("payload_deleted", { path });
-    return true;
-  }
-
   /**
    * Serialise writes to one path. An autosave flush racing a lock re-seal must
-   * never interleave; the chain keeps a strict order per file. Unlike v1's
-   * adapter swap there are no scratch files here: body writes go through
-   * vault.modify so the editor buffer stays in sync with disk.
+   * never interleave; the chain keeps a strict order per file. Body writes go
+   * through vault.modify so the editor buffer stays in sync with disk.
    */
   private chainWrite(path: string, write: () => Promise<void>): Promise<void> {
     const normalized = normalizePath(path);
@@ -339,58 +241,6 @@ export class SealedNoteStore {
       await this.backupBeforeOverwrite(path);
     } catch {
       /* backup is best effort */
-    }
-  }
-
-  private async writeAndSwap(path: string, content: string): Promise<void> {
-    await this.backupBeforeOverwrite(path);
-    const adapter = this.app.vault.adapter;
-    const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const tmp = normalizePath(`${path}.${token}.tmp`);
-    const prev = normalizePath(`${path}.${token}.old`);
-    let moved = false;
-
-    await adapter.write(tmp, content);
-    try {
-      if (!(await adapter.exists(path))) {
-        await adapter.rename(tmp, path);
-        return;
-      }
-      await adapter.rename(path, prev);
-      moved = true;
-      await adapter.rename(tmp, path);
-    } catch (error) {
-      if (moved) await adapter.rename(prev, path).catch(() => undefined);
-      this.log.warn("atomic_write_fallback", { path, error: String(error) });
-      await this.overwrite(path, content);
-    } finally {
-      await adapter.remove(tmp).catch(() => undefined);
-      if (moved) await adapter.remove(prev).catch(() => undefined);
-      await this.sweepScratchFiles(path);
-    }
-  }
-
-  private async overwrite(path: string, content: string): Promise<void> {
-    try {
-      await this.app.vault.adapter.write(path, content);
-    } catch (error) {
-      throw Err.io(`无法写入加密数据（${path}）：${describeError(error)}`, { path });
-    }
-  }
-
-  /**
-   * Remove the fixed-name scratch files older builds left behind. Best effort:
-   * a sidecar another process still holds open is retried on the next write.
-   */
-  private async sweepScratchFiles(path: string): Promise<void> {
-    const adapter = this.app.vault.adapter;
-    for (const legacy of [`${path}.tmp`, `${path}.old`]) {
-      const full = normalizePath(legacy);
-      try {
-        if (await adapter.exists(full)) await adapter.remove(full);
-      } catch {
-        /* still open elsewhere - harmless */
-      }
     }
   }
 
@@ -424,7 +274,6 @@ export class SealedNoteStore {
 
   async isSealedFile(file: TFile): Promise<boolean> {
     if (this.isSealedPath(file.path)) return true;
-    if (this.isPayloadPath(file.path)) return false;
     if (file.extension !== "md") return false;
     try {
       return noteBodyState(await this.app.vault.read(file)) === "sealed";

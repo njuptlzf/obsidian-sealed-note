@@ -69,8 +69,7 @@ export class KeyCopyRefreshService {
 
       try {
         // A locked note's body IS the envelope; unlocked plaintext is not a
-        // key source. A v1 sidecar note is represented by its payload, so skip
-        // the note itself to avoid counting the same copy twice.
+        // key source.
         if (this.notes.isSealedPath(file.path)) {
           const noteRaw = await this.app.vault.read(file).catch(() => "");
           if (noteBodyState(noteRaw) !== "sealed") continue;

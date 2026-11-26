@@ -35,11 +35,11 @@ import { ConfirmModal, RecoveryKeyModal, SetupModal, UnlockModal } from "./ui/mo
 import { registerEncryptedCodeBlocks } from "./inline/codeblock";
 import { registerInlinePayloads } from "./inline/postprocessor";
 import { generateRecoveryKey, recoveryKeyText, groupRecovery } from "./core/recovery";
-import { createKeyring, createKeyringWithoutPassword, formatKeyringFromCopy, keyFingerprint, newVaultId, SLOT_PASSWORD, SLOT_TOTP, SLOT_PASSWORD_TOTP, KeyringData, setSlot } from "./core/keyring";
+import { createKeyring, createKeyringWithoutPassword, formatKeyringFromCopy, keyFingerprint, newVaultId, SLOT_PASSWORD, SLOT_TOTP, SLOT_PASSWORD_TOTP, SLOT_RECOVERY, KeyringData, setSlot } from "./core/keyring";
 import { generateTotpSecret, totpUri, formatSecret } from "./core/totp";
 import { describeError, Err } from "./util/errors";
 import { log, setLogLevel } from "./util/log";
-import { findUnsealedBlocks, noteBodyState, openInline, parseNoteRef } from "./core/format";
+import { findUnsealedBlocks, openInline } from "./core/format";
 import { TotpSetupModal } from "./ui/totp-modal";
 import { CandidatePickerModal, SecretPromptModal } from "./ui/recovery-modals";
 import { UnlockModeModal, PasswordPromptModal } from "./ui/mode-modals";
@@ -129,7 +129,6 @@ export default class SealedNotePlugin extends Plugin {
     // Order matters: NoteKeyringStore depends on SealedNoteStore for the
     // ".sealed.md" path rule. Construct the store first.
     this.notes = new SealedNoteStore(this.app, dataDir);
-    this.notes.setPlaceholderHint(t("note.placeholder"));
     // Old builds kept plaintext working copies in a visible folder; wipe the
     // leftovers and warn about notes still revealed from a crash.
     void this.guard(() => this.recoverAfterCrash());
@@ -309,7 +308,6 @@ export default class SealedNotePlugin extends Plugin {
   async saveSettings(): Promise<void> {
     await this.saveData(this.settingsData);
     setLanguage(this.settingsData.language);
-    this.notes?.setPlaceholderHint(t("note.placeholder"));
     this.refreshStatusBar();
   }
 
@@ -514,12 +512,6 @@ export default class SealedNotePlugin extends Plugin {
       id: "refresh-key-copies",
       name: t("cmd.refreshCopies.name"),
       callback: () => void this.guard(() => this.refreshKeyCopies()),
-    });
-
-    this.addCommand({
-      id: "migrate-to-single-file",
-      name: t("cmd.migrate.name"),
-      callback: () => void this.guard(() => this.migrateToSingleFile()),
     });
 
     this.addCommand({
@@ -1014,7 +1006,6 @@ export default class SealedNotePlugin extends Plugin {
         dek,
         path,
         name,
-        t("note.placeholder"),
       );
       this.pendingKeyring = null;
       this.sessions.put(file.path, dek, providerId);
@@ -1754,55 +1745,6 @@ export default class SealedNotePlugin extends Plugin {
   }
 
   /**
-   * v1 (ref annotation + sealed-data payload) -> v2 (body envelope).
-   * Each note is an independent, idempotent transaction: write the envelope
-   * into the body first, then delete the payload. A failure leaves the v1 note
-   * untouched and the command can be re-run safely.
-   */
-  async migrateToSingleFile(): Promise<void> {
-    const notes = this.app.vault.getFiles().filter((f) => this.notes.isSealedPath(f.path));
-    let migrated = 0;
-    let skipped = 0;
-    let failed = 0;
-    for (const file of notes) {
-      try {
-        const raw = await this.app.vault.read(file).catch(() => "");
-        if (noteBodyState(raw) !== "sidecar-ref") {
-          // Already v2, or an unlocked plaintext body: never touch either.
-          skipped++;
-          continue;
-        }
-        const ref = parseNoteRef(raw);
-        if (!ref) {
-          skipped++;
-          continue;
-        }
-        const source = await this.notes.readPayload(ref);
-        if (!source) throw new Error(t("notice.payloadMissingShort"));
-        // 1) write envelope into the note body (the new single source of truth)
-        await this.markSelfWrite(file.path, () =>
-          this.notes.replaceBodyWithEnvelope(file, source.envelope),
-        );
-        // 2) only now remove the old sidecar. If this fails the note is still
-        //    fully valid v2; the leftover payload is harmless and can be
-        //    deleted manually.
-        await this.notes.deletePayload(ref);
-        // Drop session state so the next unlock reads the new body.
-        this.sessions.lock(file.path);
-        migrated++;
-        this.log.info("note_migrated_to_single_file", { path: file.path, ref });
-      } catch (error) {
-        failed++;
-        this.log.warn("migrate_failed", { path: file.path, error: String(error) });
-      }
-    }
-    new Notice(
-      t("notice.migrated", { n: migrated, skip: skipped, fail: failed }),
-      failed ? 10000 : 8000,
-    );
-  }
-
-  /**
    * A private note is identified by the .sealed.md suffix. If the user renames
    * one and drops that suffix, it would silently become an ordinary note and
    * lose its unlock entry point. Put the suffix back automatically, and carry
@@ -1968,31 +1910,51 @@ export default class SealedNotePlugin extends Plugin {
     await this.keyCopies.refreshAll(kr);
   }
 
-  async showRecoveryKey(): Promise<void> {
-    const dek = await this.requireInitialised();
-    if (!dek) return;
-    const ok = await new Promise<boolean>((resolve) => {
-      new ConfirmModal(
-        this.app,
-        {
-          title: t("notice.recoveryRegenTitle"),
-          body:
-            t("notice.recoveryRegenBody"),
-          confirmText: t("notice.recoveryRegenOk"),
-          danger: true,
-        },
-        resolve,
-      ).open();
-    });
-    if (!ok) return;
+  /**
+   * Save the recovery key from settings. Works whether or not one exists yet:
+   * "set" and "reset" are the same operation, only the confirmation differs.
+   * Re-auth follows the configured mode (TOTP -> code, password -> password,
+   * both -> both); a master password is never required just to reach this flow.
+   */
+  async setOrResetRecoveryKey(): Promise<void> {
+    if (!(await this.hasKeyring())) {
+      new Notice(t("settings.noKey"), 8000);
+      return;
+    }
+    const kr = await this.unlockService.requireKeyring();
+    const alreadySet = !!kr.slots[SLOT_RECOVERY];
+    if (alreadySet) {
+      const ok = await new Promise<boolean>((resolve) => {
+        new ConfirmModal(
+          this.app,
+          {
+            title: t("notice.recoveryRegenTitle"),
+            body: `${t("notice.recoveryRegenBody")}\n\n${t("recovery.shareWarning")}`,
+            confirmText: t("notice.recoveryRegenOk"),
+            danger: true,
+          },
+          resolve,
+        ).open();
+      });
+      if (!ok) return;
+    }
 
+    const reauth = await this.unlockService.reauthForSettings(t("settings.recovery"));
+    if (!reauth) {
+      new Notice(t("settings.modeNoCredential"), 10000);
+      return;
+    }
     const key = generateRecoveryKey();
-    await this.unlockService.replaceRecovery(dek, key);
-    const fingerprint = await keyFingerprint(dek);
+    await this.unlockService.replaceRecovery(reauth.dek, key);
+    const fingerprint = await keyFingerprint(reauth.dek);
     await new Promise<boolean>((resolve) => {
       new RecoveryKeyModal(this.app, key, fingerprint, this.app.vault.getName(), resolve).open();
     });
-    new Notice(t("notice.recoveryDone"), 8000);
+    new Notice(alreadySet ? t("notice.recoveryDone") : t("notice.recoverySaved"), 8000);
+  }
+
+  async showRecoveryKey(): Promise<void> {
+    await this.setOrResetRecoveryKey();
   }
 
   /** Restore the local seed cache from the phone's otpauth URI, no re-scan needed. */
@@ -2019,7 +1981,31 @@ export default class SealedNotePlugin extends Plugin {
       new UnlockModeModal(this.app, resolve).open();
     });
     if (!mode) return;
+    await this.applyUnlockMode(dek, kr, mode);
+  }
 
+  /**
+   * Switch the vault's decryption mode from the settings page. Re-authenticate
+   * with the CURRENT mode's credential first, so a walk-up cannot downgrade the
+   * unlock requirements, then reuse the existing TOTP seed when one is on this
+   * device (no QR re-scan for password <-> TOTP <-> both).
+   */
+  async switchUnlockMode(mode: "password" | "totp" | "password+totp"): Promise<void> {
+    const reauth = await this.unlockService.reauthForSettings(t("mode.title"));
+    if (!reauth) {
+      new Notice(t("settings.modeNoCredential"), 10000);
+      return;
+    }
+    const applied = await this.applyUnlockMode(reauth.dek, reauth.kr, mode);
+    if (applied) this.refreshStatusBar();
+  }
+
+  /** Collect the credentials the target mode needs and hand them to configureMode. */
+  private async applyUnlockMode(
+    dek: Uint8Array,
+    kr: KeyringData,
+    mode: "password" | "totp" | "password+totp",
+  ): Promise<boolean> {
     if (mode === "password") {
       // From a strict two-factor vault the standalone password slot no longer
       // exists (and in TOTP-only mode it never did). configureMode("password")
@@ -2032,32 +2018,49 @@ export default class SealedNotePlugin extends Plugin {
         : await new Promise<{ password: string; hint: string } | null>((resolve) => {
             new SetupModal(this.app, resolve).open();
           });
-      if (!hasPasswordDoor && !credentials) return;
+      if (!hasPasswordDoor && !credentials) return false;
       await this.unlockService.configureMode(dek, mode, { password: credentials?.password });
       new Notice(t("notice.modePassword"));
-      return;
+      this.log.info("unlock_mode_configured", { mode });
+      return true;
     }
 
-    const password = mode === "password+totp"
-      ? await new Promise<string | null>((resolve) => {
+    let password: string | undefined;
+    if (mode === "password+totp") {
+      // A TOTP-only (or already strict combined) vault has no standalone
+      // password to confirm. Ask for a NEW one there; otherwise confirm the
+      // existing password that will be folded into the combined slot.
+      if (kr.slots[SLOT_PASSWORD]) {
+        const confirmed = await new Promise<string | null>((resolve) => {
           new PasswordPromptModal(this.app, t("mode.confirmPw"), resolve).open();
-        })
-      : undefined;
-    if (mode === "password+totp" && !password) return;
+        });
+        password = confirmed ?? undefined;
+      } else {
+        const credentials = await new Promise<{ password: string; hint: string } | null>((resolve) => {
+          new SetupModal(this.app, resolve).open();
+        });
+        password = credentials ? credentials.password : undefined;
+      }
+      if (!password) return false;
+    }
 
-    const account = this.app.vault.getName();
-    const result = await new Promise<{ seed: string; otpauth: string } | null>((resolve) => {
-      new TotpSetupModal(this.app, account, resolve).open();
-    });
-    if (!result) return;
+    // Reuse the existing seed when switching between TOTP-bearing modes; only
+    // enrol a new authenticator when this device has no seed at all.
+    let seed = await this.unlockService.currentSeed(kr);
+    if (!seed) {
+      const account = this.app.vault.getName();
+      const result = await new Promise<{ seed: string; otpauth: string } | null>((resolve) => {
+        new TotpSetupModal(this.app, account, resolve).open();
+      });
+      if (!result) return false;
+      seed = result.seed;
+    }
 
-    await this.unlockService.configureMode(dek, mode, { password: password ?? undefined, seed: result.seed });
+    await this.unlockService.configureMode(dek, mode, { password: password ?? undefined, seed });
     await this.keyCopies.refreshAll(await this.unlockService.requireKeyring());
-    new Notice(
-      t("notice.totpDone"),
-      12000,
-    );
+    new Notice(t("notice.totpDone"), 12000);
     this.log.info("unlock_mode_configured", { mode });
+    return true;
   }
 
 }

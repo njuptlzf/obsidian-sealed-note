@@ -1,10 +1,9 @@
 /**
- * On disk formats. Three envelopes, all versioned, all JSON or base64 text so a
+ * On disk formats. Two envelopes, all versioned, all JSON or base64 text so a
  * human can audit them and tools/decrypt.html can reproduce them byte for byte.
  *
- *   1. keyring   - one small file in the plugin directory, holds wrapped DEK
- *   2. note      - one ".sealed" file per private note
- *   3. inline    - "sn1.<base64>" payloads inside normal markdown
+ *   1. note   - one ".sealed.md" file per private note, body IS the envelope
+ *   2. inline - "sn1.<base64>" payloads inside normal markdown
  *
  * Nothing in here touches Obsidian APIs, so the tests and the offline decryptor
  * can use the exact same functions.
@@ -26,77 +25,11 @@ export const FORMAT_NOTE = "sealed-note/note/1";
 export const INLINE_VERSION = "sn1";
 
 /**
- * Legacy note form: the envelope was hidden inside an HTML comment. Kept for
- * READING old notes only. New notes are a visible placeholder plus a stable ID;
- * the envelope lives in a sidecar payload file outside the Markdown note.
+ * The envelope is wrapped in an HTML comment so it stays invisible in reading
+ * view while remaining a single, self-contained file.
  */
 export const NOTE_COMMENT_PREFIX = `<!-- ${FORMAT_NOTE}`;
 export const NOTE_COMMENT_SUFFIX = "-->";
-
-/** A new-style note carries only this opaque reference to its payload file. */
-export const NOTE_REF_PREFIX = "<!-- sealed-note:ref=";
-export const NOTE_REF_SUFFIX = " -->";
-export const PAYLOAD_EXTENSION = ".sealedpayload";
-
-export function noteRefLine(id: string): string {
-  return `${NOTE_REF_PREFIX}${id}${NOTE_REF_SUFFIX}`;
-}
-
-export function parseNoteRef(text: string): string | null {
-  const start = (text ?? "").indexOf(NOTE_REF_PREFIX);
-  if (start < 0) return null;
-  const from = start + NOTE_REF_PREFIX.length;
-  const end = (text ?? "").indexOf(NOTE_REF_SUFFIX, from);
-  if (end < 0) return null;
-  const id = text.slice(from, end).trim();
-  return /^[A-Za-z0-9-]{8,64}$/.test(id) ? id : null;
-}
-
-/**
- * Note body shown in any Markdown viewer: nothing at all. Both the ref and the
- * hint are HTML comments, so rendered view is a clean blank page while source
- * view still carries the stable ID the plugin needs.
- */
-export function serializeNotePlaceholder(ref: string, hint: string): string {
-  return `${noteRefLine(ref)}\n<!-- ${hint.trim()} -->\n`;
-}
-
-/**
- * In-place editing: while a note is UNLOCKED its body carries the plaintext
- * directly (after the invisible ref line). No working-copy file ever exists -
- * a plaintext file in any folder (hidden or not) is readable without a
- * password, which defeats the whole point. Locking re-seals and restores the
- * placeholder body.
- */
-export function serializeNoteRevealed(ref: string, plaintext: string): string {
-  return `${noteRefLine(ref)}\n${plaintext}`;
-}
-
-/**
- * Plaintext inside a revealed body, or null when the body is a locked
- * placeholder (only HTML comments after the ref line).
- */
-export function parseRevealedBody(text: string): string | null {
-  const src = text ?? "";
-  const start = src.indexOf(NOTE_REF_PREFIX);
-  if (start < 0) return null;
-  const end = src.indexOf(NOTE_REF_SUFFIX, start);
-  if (end < 0) return null;
-  const body = src.slice(end + NOTE_REF_SUFFIX.length);
-  const trimmed = body.trim();
-  if (!trimmed) return "";
-  // A locked placeholder's tail is comment markup, not content.
-  if (trimmed.startsWith("<!--") && trimmed.endsWith("-->")) return null;
-  // serializeNoteRevealed inserts exactly one newline between the ref line and
-  // the plaintext; drop it so reveal -> edit -> flush round-trips byte-for-byte
-  // (otherwise a leading \n leaks into the encrypted payload on every save).
-  return body.startsWith("\n") ? body.slice(1) : body;
-}
-
-/** Payload files are raw JSON: they are not Markdown and need no wrapper. */
-export function serializeNotePayload(envelope: NoteEnvelope): string {
-  return JSON.stringify(envelope, null, 2) + "\n";
-}
 
 /** fenced code block languages we accept as an encrypted block */
 export const INLINE_LANGS = ["encrypted_txt", "txt_encrypted", "sealed"];
@@ -398,23 +331,16 @@ export function findUnsealedBlocks(source: string): FencedBlock[] {
 /**
  * What a `.sealed.md` file body currently holds.
  *
- *   sealed      - the body IS the encrypted envelope (locked, v2 native)
- *   revealed    - the body is plaintext (unlocked; no annotation at all)
- *   sidecar-ref - old v1 placeholder pointing at sealed-data (read-only,
- *                 migration target)
- *   empty       - blank body, treated like `revealed` for an unlocked note
- *
- * Order matters: an envelope is recognised before a ref, because a legacy
- * note's envelope can itself contain the word "sealed-note:ref" in its
- * ciphertext-free JSON wrapper only if it is genuinely an envelope.
+ *   sealed    - the body IS the encrypted envelope (locked)
+ *   revealed  - the body is plaintext (unlocked; no annotation at all)
+ *   empty     - blank body, treated like `revealed` for an unlocked note
  */
-export type NoteBodyState = "sealed" | "revealed" | "sidecar-ref" | "empty";
+export type NoteBodyState = "sealed" | "revealed" | "empty";
 
 export function noteBodyState(text: string): NoteBodyState {
   const raw = (text ?? "").trim();
   if (!raw) return "empty";
   if (parseNoteEnvelope(text)) return "sealed";
-  if (parseNoteRef(text)) return "sidecar-ref";
   return "revealed";
 }
 

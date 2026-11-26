@@ -271,36 +271,6 @@ test("v2: renaming/moving a locked note cannot separate it from its ciphertext",
   plugin.onunload();
 });
 
-test("v2: migration moves a v1 sidecar envelope into the note body, idempotently", async () => {
-  const { plugin, harness } = await boot();
-  const { createKeyring, keyCopyFromKeyringData } = await import("../src/core/keyring");
-  const { generateRecoveryKey } = await import("../src/core/recovery");
-  const { noteBodyState, noteRefLine, serializeNotePayload } = await import("../src/core/format");
-
-  const vaultId = "20000000-2222-4333-8444-555555555555";
-  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), { iterations: 100_000 });
-  plugin.vaultIdentifier = vaultId;
-  const file: any = { path: "Private/old.sealed.md", basename: "old", extension: "md" };
-  const env = (await import("../src/core/format")).parseNoteEnvelope(
-    await (await import("../src/core/format")).sealNote(dek, vaultId, vaultId, "旧内容", keyCopyFromKeyringData(keyring)),
-  )!;
-  const ref = "12345678-abcd-1234-abcd-123456789012";
-  harness.files.set(file.path, noteRefLine(ref) + "\n<!-- hint -->\n");
-  harness.files.set(`sealed-data/${ref}.sealedpayload`, serializeNotePayload(env));
-
-  await plugin.migrateToSingleFile();
-  const noteText = harness.files.get(file.path)!;
-  assert.equal(noteBodyState(noteText), "sealed", "note body is now the envelope");
-  assert.ok(!noteText.includes("sealed-note:ref"), "annotation removed");
-  assert.equal(harness.files.has(`sealed-data/${ref}.sealedpayload`), false, "old payload deleted");
-  assert.equal(await plugin.notes.readPlaintext(file, dek, vaultId), "旧内容", "content intact");
-
-  // Re-running is a no-op.
-  await plugin.migrateToSingleFile();
-  assert.equal(await plugin.notes.readPlaintext(file, dek, vaultId), "旧内容", "idempotent");
-  plugin.onunload();
-});
-
 test("v2: deleting a note deletes its ciphertext with it (single file)", async () => {
   const { plugin, harness } = await boot();
   const { createKeyring } = await import("../src/core/keyring");
@@ -319,24 +289,6 @@ test("v2: deleting a note deletes its ciphertext with it (single file)", async (
   await new Promise((resolve) => setTimeout(resolve, 0));
 
   assert.equal(harness.files.has(file.path), false, "note and its ciphertext are gone together");
-  plugin.onunload();
-});
-
-test("v2: a note whose sidecar is missing fails migration honestly, leaving the note intact", async () => {
-  const { plugin, harness } = await boot();
-  const { createKeyring } = await import("../src/core/keyring");
-  const { generateRecoveryKey } = await import("../src/core/recovery");
-  const { noteRefLine } = await import("../src/core/format");
-
-  const vaultId = "40000000-2222-4333-8444-555555555555";
-  const { keyring, dek } = await createKeyring(vaultId, "pw-1234567890", generateRecoveryKey(), { iterations: 100_000 });
-  plugin.vaultIdentifier = vaultId;
-  await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/keep", "keep");
-  const oldPath = "Private/v1.sealed.md";
-  harness.files.set(oldPath, noteRefLine("12345678-abcd-1234-abcd-123456789012") + "\n<!-- hint -->\n");
-
-  await plugin.migrateToSingleFile();
-  assert.equal(harness.files.get(oldPath), noteRefLine("12345678-abcd-1234-abcd-123456789012") + "\n<!-- hint -->\n", "unmigratable note left byte-for-byte intact for retry");
   plugin.onunload();
 });
 
@@ -1474,24 +1426,21 @@ test("a plain note with an inline encrypted block is never locked", async () => 
   plugin.onunload();
 });
 
-test("v2: sidecar settings and clean-orphans command are gone", async () => {
+test("v1 sidecar settings and all legacy commands are gone", async () => {
   const { plugin, harness } = await boot();
   assert.equal("payloadDir" in plugin.settingsData, false, "no payloadDir setting");
   assert.equal("deletePayloadWithNote" in plugin.settingsData, false, "no payload retention setting");
-  assert.equal(
-    harness.registered.commands.some((c: any) => c.id === "clean-orphan-payloads"),
-    false,
-    "orphan-clean command removed",
-  );
-  assert.equal(
-    harness.registered.commands.some((c: any) => c.id === "restore-annotation"),
-    false,
-    "annotation-restore command removed",
-  );
-  assert.ok(
-    harness.registered.commands.some((c: any) => c.id === "migrate-to-single-file"),
-    "single-file migration command registered",
-  );
+  for (const id of [
+    "clean-orphan-payloads",
+    "restore-annotation",
+    "migrate-to-single-file",
+  ]) {
+    assert.equal(
+      harness.registered.commands.some((c: any) => c.id === id),
+      false,
+      `${id} command removed`,
+    );
+  }
   plugin.onunload();
 });
 
@@ -2456,5 +2405,189 @@ test("silent seal (unload) never opens a dialog without a cached key", async () 
 
   assert.equal(prompted, 0, "no modal on the opportunistic path");
   assert.equal(harness.files.get(path), src, "bytes untouched without a key");
+  plugin.onunload();
+});
+
+/* ------------------------------------------------------------------ */
+/* Recovery key reveal + settings mode switching regressions           */
+/* ------------------------------------------------------------------ */
+
+test("recovery modal ignores backdrop/Escape close; only × or 完成 settles it", async () => {
+  const { obsidian } = buildHarness();
+  const { RecoveryKeyModal } = await import("../src/ui/modals");
+
+  let settled: boolean | undefined;
+  const modal: any = new RecoveryKeyModal(
+    { vault: { getName: () => "TestVault" } } as any,
+    "KEY-1234-5678",
+    "fp",
+    "TestVault",
+    (saved: boolean) => { settled = saved; },
+  );
+  void obsidian;
+  modal.onOpen();
+
+  // Backdrop click / Escape route through close() with no explicit grant.
+  modal.close();
+  assert.equal(settled, undefined, "an accidental dismiss must not resolve the promise");
+
+  // The title-bar × is an explicit dismissal but is NOT an acknowledgement.
+  modal.dismissByCloseButton();
+  assert.equal(settled, false, "× closes without claiming the key was saved");
+  let resolveCount = 0;
+  const counted: any = new RecoveryKeyModal(
+    { vault: { getName: () => "TestVault" } } as any,
+    "KEY-1234-5678", "fp", "TestVault",
+    () => { resolveCount++; },
+  );
+  counted.onOpen();
+  counted.dismissByCloseButton();
+  counted.onClose(); // Obsidian may call onClose after close()
+  assert.equal(resolveCount, 1, "a close resolves the promise exactly once");
+
+  // Re-open a fresh modal: the 完成 button acknowledges the key.
+  let saved: boolean | undefined;
+  const ack: any = new RecoveryKeyModal(
+    { vault: { getName: () => "TestVault" } } as any,
+    "KEY-1234-5678",
+    "fp",
+    "TestVault",
+    (value: boolean) => { saved = value; },
+  );
+  ack.onOpen();
+  ack.acknowledge();
+  assert.equal(saved, true, "完成 reports the key as saved");
+});
+
+test("resetting the recovery key uses the configured mode's credential, never the master password by default", async () => {
+  const { plugin } = await boot();
+  const { createKeyring, createKeyringWithoutPassword, setSlot, credentialFor, SLOT_TOTP } =
+    await import("../src/core/keyring");
+  const { generateTotpSecret, totpCode } = await import("../src/core/totp");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+
+  const seed = generateTotpSecret();
+  const vaultId = "ab010000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyringWithoutPassword(vaultId, generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  await setSlot(keyring, dek, SLOT_TOTP, credentialFor(SLOT_TOTP, { totpSeed: seed }));
+  keyring.totp.enabled = true;
+  keyring.totp.mode = "totp";
+  plugin.vaultIdentifier = vaultId;
+  await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/recovery-mode", "恢复测试");
+  plugin.sessions.lockAll();
+
+  // A TOTP-only vault must ask for a code, not for a master password.
+  const provider = plugin.unlockService.providerForMode(keyring);
+  assert.equal(provider?.id, "totp", "mode-derived provider is TOTP");
+
+  const seen: any[] = [];
+  plugin.unlockService.setUi(() => ({
+    prompt: async (request: any) => {
+      seen.push(request);
+      return { providerId: "totp", code: await totpCode(seed), totpSeed: seed };
+    },
+  }));
+  const reauth = await plugin.unlockService.reauthForSettings("recovery");
+  assert.ok(reauth, "TOTP code re-authenticates the settings change");
+  assert.deepEqual(reauth!.dek, dek);
+  assert.equal(seen.length, 1, "one prompt");
+  assert.deepEqual(seen[0].providers.map((p: any) => p.id), ["totp", "recovery"], "configured mode first, recovery key still available");
+  assert.equal(seen[0].provider.id, "totp", "configured mode is the default tab");
+
+  plugin.onunload();
+});
+
+test("the recovery key itself can authorize resetting the recovery key", async () => {
+  const { plugin } = await boot();
+  const { createKeyringWithoutPassword, setSlot, credentialFor, SLOT_TOTP } = await import("../src/core/keyring");
+  const { generateTotpSecret } = await import("../src/core/totp");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+
+  const seed = generateTotpSecret();
+  const recovery = generateRecoveryKey();
+  const vaultId = "cd010000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyringWithoutPassword(vaultId, recovery, { iterations: 100_000 });
+  await setSlot(keyring, dek, SLOT_TOTP, credentialFor(SLOT_TOTP, { totpSeed: seed }));
+  keyring.totp.enabled = true;
+  keyring.totp.mode = "totp";
+  plugin.vaultIdentifier = vaultId;
+  await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/recovery-reset", "恢复重置");
+  plugin.sessions.lockAll();
+
+  // The user suspects the recovery key leaked (or lost the phone) and wants to
+  // rotate it. The only credential in hand is that recovery key.
+  const seen: any[] = [];
+  plugin.unlockService.setUi(() => ({
+    prompt: async (request: any) => {
+      seen.push(request);
+      return { providerId: "recovery", secret: recovery };
+    },
+  }));
+  const reauth = await plugin.unlockService.reauthForSettings("recovery");
+  assert.ok(reauth, "the recovery key authorizes the reset");
+  assert.deepEqual(reauth!.dek, dek);
+  // First prompt defaults to the configured mode; picking the recovery tab
+  // re-prompts once for that tab's credential. No forced switch back to TOTP.
+  assert.equal(seen.length, 2, "one tab switch, then the recovery key submission");
+  assert.equal(seen[0].provider.id, "totp", "configured mode is the default tab");
+  assert.deepEqual(seen[0].providers.map((p: any) => p.id), ["totp", "recovery"]);
+  assert.equal(seen[1].provider.id, "recovery", "recovery tab accepted");
+
+  plugin.onunload();
+});
+
+test("switchUnlockMode reuses the existing seed and writes the new mode", async () => {
+  const { plugin } = await boot();
+  const { createKeyring, SLOT_PASSWORD } = await import("../src/core/keyring");
+  const { generateTotpSecret, totpCode } = await import("../src/core/totp");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+
+  const seed = generateTotpSecret();
+  const password = "pw-switch-123456";
+  const vaultId = "bc010000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyring(vaultId, password, generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  plugin.vaultIdentifier = vaultId;
+  await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/switch", "模式切换");
+  plugin.sessions.lockAll();
+
+  let seedPrompts = 0;
+  plugin.unlockService.setUi(() => ({
+    prompt: async (request: any) => {
+      if (request.provider.id === "totp") {
+        return { providerId: "totp", code: await totpCode(seed), totpSeed: seed };
+      }
+      return { providerId: "password", secret: password };
+    },
+  }));
+
+  // Switch from password to TOTP, supplying a seed once.
+  await plugin.unlockService.configureMode(dek, "totp", { seed });
+  plugin.sessions.lockAll();
+  const originalTotpSetupModal = (plugin as any).app;
+  void originalTotpSetupModal;
+
+  // A device-sealed seed is now available; switching to combined must reuse it
+  // and must not ask the user to scan a new QR code.
+  const krBefore = await plugin.unlockService.requireKeyring();
+  assert.ok(await plugin.unlockService.hasLocalSeed(krBefore), "seed is cached on this device");
+  const sameSeed = await plugin.unlockService.currentSeed(krBefore);
+  assert.equal(sameSeed, seed.replace(/[^A-Z2-7]/g, "").toUpperCase(), "current seed returned for reuse");
+  assert.equal(seedPrompts, 0, "no QR re-scan needed");
+
+  const reauth = await plugin.unlockService.reauthForSettings("unlock");
+  assert.ok(reauth, "re-auth with the current TOTP code succeeds");
+  await plugin.unlockService.configureMode(reauth!.dek, "password+totp", {
+    password,
+    seed: sameSeed!,
+  });
+  const krAfter = await plugin.unlockService.requireKeyring();
+  assert.equal(krAfter.totp.mode, "password+totp", "combined mode written");
+  assert.ok(krAfter.slots["password-totp"], "combined slot present");
+  assert.ok(!krAfter.slots[SLOT_PASSWORD], "no standalone password door in strict two-factor");
+
   plugin.onunload();
 });

@@ -80,7 +80,7 @@ Settings → Sealed Note → **When an unlocked note re-locks**:
 >
 > ⚠️ **The one window:** while unlocked, plaintext lives in the `.sealed.md` body and is indexed and synced. That is the honest boundary of application-layer in-place editing. Unlock only when editing; the configured policy (default: lock on focus loss) re-seals it for you. If Obsidian crashes while unlocked, the plaintext body is left untouched — nothing is silently wiped, and the next lock seals it with the real key.
 >
-> Sync `.sealed.md` as you would any note. One file is the whole note, so there is nothing extra to remember to sync. Old v1 vaults (annotation + `sealed-data/`) keep working read-only until you run **Convert notes to single-file format** from the command palette; the migration is idempotent and skips anything already converted.
+> Sync `.sealed.md` as you would any note. One file is the whole note, so there is nothing extra to remember to sync.
 
 **Deleting a note** deletes its ciphertext with it, since they are the same file. Ordinary file backup / version history is the recovery path, exactly as for any other note.
 

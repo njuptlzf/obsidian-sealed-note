@@ -3,7 +3,7 @@
 import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type SealedNotePlugin from "../main";
 import { keyFingerprint, describeGuardWait, guardRemainingMs, SLOT_PASSWORD } from "../core/keyring";
-import { ConfirmModal, RecoveryKeyModal, SetupModal } from "./modals";
+import { RecoveryKeyModal, SetupModal } from "./modals";
 import { generateRecoveryKey } from "../core/recovery";
 import { createKeyring } from "../core/keyring";
 import { newVaultId } from "../core/keyring";
@@ -99,15 +99,15 @@ export class SealedNoteSettingTab extends PluginSettingTab {
       .setName(t("settings.recovery"))
       .setDesc(kr.slots.recovery ? t("settings.recoveryDesc") : t("settings.recoveryMissing"))
       .addButton((btn) =>
-        btn.setButtonText(t("settings.regenerate")).onClick(async () => {
-          const dek = await this.plugin.unlockService.dekFor("__settings__", { subject: t("settings.recovery") });
-          if (!dek) return;
-          const key = generateRecoveryKey();
-          await this.plugin.unlockService.replaceRecovery(dek, key);
-          const fp = await keyFingerprint(dek);
-          new RecoveryKeyModal(this.app, key, fp, this.app.vault.getName(), () => this.display()).open();
-        }),
+        btn
+          .setButtonText(kr.slots.recovery ? t("settings.resetRecovery") : t("settings.setRecovery"))
+          .onClick(async () => {
+            await this.plugin.setOrResetRecoveryKey();
+            this.display();
+          }),
       );
+
+    card.createEl("p", { text: t("recovery.shareWarning"), cls: "sealed-hint" });
 
     const modeLabels: Record<string, string> = {
       password: t("settings.mode.password"),
@@ -120,14 +120,18 @@ export class SealedNoteSettingTab extends PluginSettingTab {
       : `未启用。当前模式：${modeLabels[mode] ?? mode}`;
 
     new Setting(card)
-      .setName(t("settings.totp"))
+      .setName(t("settings.modeSwitch"))
       .setDesc(totpDesc)
-      .addButton((btn) => {
-        btn.setButtonText(kr.totp.enabled ? t("settings.change") : t("settings.configure")).onClick(async () => {
-          await this.plugin.setupTotp();
-          this.display();
-        });
-      });
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOptions(modeLabels)
+          .setValue(mode)
+          .onChange(async (value) => {
+            if (value === mode) return;
+            await this.plugin.switchUnlockMode(value as "password" | "totp" | "password+totp");
+            this.display();
+          }),
+      );
 
     // Old combined-mode vaults have a standalone password slot beside the
     // combined one - the single-factor hole. Offer to close it in one click.
