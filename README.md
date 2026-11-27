@@ -10,16 +10,15 @@ An Obsidian plugin that encrypts **only the notes and fragments you choose** —
 
 *Settings page with the "Choose an unlock method" modal.*
 
-![Locked private note — the padlock view, "Unlock and edit"](docs/screenshots/locked-note-view.png)
-
-*A private note in its locked state: the body is covered by a padlock until you unlock it.*
-
 ## Features
 
-- **Only what you mark is encrypted** — full private notes (`.sealed.md`), inline blocks, and inline `sn1.…` fragments. The rest of the vault stays plain and searchable.
+- **Only what you mark is encrypted** — whole notes, inline blocks, and inline `sn1.…` fragments. The rest of the vault stays plain and searchable.
 - **Password can be reset, never recovered** — anyone claiming to recover your password either deceives you or kept a backdoor. Here the recovery key rewraps the same data key; note content is never re-encrypted.
 - **No keyring file, no sidecar** — the wrapped key lives in the `keys` field of every locked note's own body, so it syncs with your notes and any one note can unlock the whole vault. There is no `sealed-data/` folder and no annotation to maintain.
-- **Native Markdown editing** — on unlock the plaintext is written **in place** into the note's own body: source mode, live preview, immersive mode and every editor command work as usual. There is never a second plaintext file on disk.
+- **Lock any note in place** — right-click any Markdown note → *Lock this document in place*. The filename stays exactly as it is; only the body becomes ciphertext. No custom view, no renamed copy.
+- **Locked notes are marked in the file explorer** — a 🔒 prefix on every private note, so you can tell at a glance which files need a password. *Turn this private note into a normal note* removes the mark and the protection in one step.
+- **Native Markdown editing** — a locked note opens in the normal editor showing its ciphertext. Unlock writes plaintext **in place** into the note's own body: source mode, live preview, immersive mode and every editor command work as usual. There is never a second plaintext file on disk.
+- **Ciphertext cannot be damaged by accident** — while the buffer holds an envelope, typing, pasting, dropping and undo are refused at the editor level (content-based, any filename), and a banner at the top offers *Unlock and edit*. One stray keystroke can never corrupt a note into undecryptability.
 - **Three unlock modes, switchable any time** — password only, TOTP only, or password + TOTP as strict two-factor (no password-only door exists in that mode). The recovery key is always the last-resort channel.
 - **Automatic locking** — a three-tier policy (blur / close note / per-session) decides when an unlocked note re-encrypts and drops its key, defaulting to the strictest: lock on any focus loss.
 - **Offline emergency decrypt** — a single self-contained `tools/decrypt.html` that needs no network, for verifying backups or decrypting on a machine without Obsidian.
@@ -55,13 +54,13 @@ TOTP-only works from day one — no master password needed. The recovery key is 
 
 ### Private notes (whole-note encryption)
 
-1. Create a note via the ribbon icon or the command palette. The plugin appends `.sealed.md` for you. The key is verified **before** creating anything; if you cancel, no file is created. Disk gets exactly one file: `name.sealed.md`, whose body is the encrypted envelope from the first byte.
-   - **Renaming and moving are safe** — the ciphertext is inside the file itself, so nothing can be separated from it. If you accidentally drop the `.sealed.md` suffix, the plugin restores it.
-2. Clicking back onto a locked note shows **only a large padlock** — the file body is ciphertext. Click "Unlock and edit" to prompt for your credential.
+1. Create a note via the ribbon icon or the command palette, **or** right-click any existing Markdown note → *Lock this document in place*. New notes get `.sealed.md` from the wizard; notes locked in place keep their original filename. The key is verified **before** anything changes; cancel creates nothing.
+   - **Renaming and moving are safe** — the ciphertext is inside the file itself, so nothing can be separated from it. Locked notes are recognised by their envelope content and a small local index, not by their filename; renaming does not change the name you chose.
+2. Opening a locked note shows the ciphertext in the native editor. Reading view shows a **locked card** (🔒 *This note is encrypted*) instead of a blank page. Double-click the card or choose **Unlock and edit** from the file menu; the credential prompt happens only when you choose to unlock.
 3. Unlock replaces the body with **bare plaintext**: no ID comment, no annotation, nothing to maintain. Source mode, live preview, immersive mode and every editor command work as usual.
 4. **When it locks is decided by the lock policy** (table below). Locking encrypts the latest content and replaces the very same body with the envelope, then drops the key from memory. Obsidian's own autosave handles the plaintext while you edit; there is no second file to sync.
-5. Opening a locked note never pops a dialog or steals any pane — it just shows the padlock, and the credential prompt happens only when you choose to unlock.
-7. Inline encrypted blocks in normal notes are unaffected by the padlock — you can edit the whole document without decrypting. Plaintext blocks are sealed when you leave the note; sealed blocks unlock only when you click them. Both share the same lock-policy timing above.
+5. Opening a locked note never pops a dialog or steals any pane — the credential prompt happens only when you choose to unlock.
+6. Inline encrypted blocks in normal notes are independent of whole-note locking — you can edit the whole document without decrypting. Plaintext blocks are sealed when you leave the note; sealed blocks unlock only when you click them. Both share the same lock-policy timing above.
 
 ### Lock policy (three tiers, strictest by default)
 
@@ -76,11 +75,11 @@ Settings → Sealed Note → **When an unlocked note re-locks**:
 - "Switch window" means Obsidian loses focus (Alt+Tab, switching apps).
 - The cost of "don't lock when switching": at the middle tier, notes whose tab is still open keep plaintext in the `.sealed.md` body (indexed/synced) until you close that tab, lock manually, or quit Obsidian.
 
-> 🔒 **One file, no sidecar, no annotation.** A locked `.sealed.md` body is the encrypted envelope itself (an HTML comment wrapping JSON, invisible in reading view). Unlocking swaps it for bare plaintext; locking swaps it back. There is no `sealed-data/` directory, no `.sealedpayload` file, no `sealed-note:ref` comment, and nothing you must avoid deleting.
+> 🔒 **One file, no sidecar, no annotation.** A locked `.sealed.md` body is the encrypted envelope itself (an HTML comment wrapping JSON, rendered as a locked card in reading view). Unlocking swaps it for bare plaintext; locking swaps it back. There is no `sealed-data/` directory, no `.sealedpayload` file, no `sealed-note:ref` comment, and nothing you must avoid deleting.
 >
-> ⚠️ **The one window:** while unlocked, plaintext lives in the `.sealed.md` body and is indexed and synced. That is the honest boundary of application-layer in-place editing. Unlock only when editing; the configured policy (default: lock on focus loss) re-seals it for you. If Obsidian crashes while unlocked, the plaintext body is left untouched — nothing is silently wiped, and the next lock seals it with the real key.
+> ⚠️ **The one window:** while unlocked, plaintext lives in the note body and is indexed and synced. That is the honest boundary of application-layer in-place editing. Unlock only when editing; the configured policy (default: lock on focus loss) re-seals it for you. If Obsidian crashes while unlocked, the plaintext body is left untouched — nothing is silently wiped, and the next lock seals it with the real key.
 >
-> Sync `.sealed.md` as you would any note. One file is the whole note, so there is nothing extra to remember to sync.
+> Sync locked notes as you would any note. One file is the whole note, so there is nothing extra to remember to sync.
 
 **Deleting a note** deletes its ciphertext with it, since they are the same file. Ordinary file backup / version history is the recovery path, exactly as for any other note.
 
@@ -108,10 +107,10 @@ Select text → right-click → **Encrypt selection** → becomes `` `sn1.xxx` `
 
 | Where | Menu items |
 | --- | --- |
-| Source-mode editor (any note) | Decrypt document / Encrypt selection / Decrypt selection / Decrypt selection to clipboard |
+| Source-mode editor (any note) | Decrypt document / Encrypt selection / Decrypt selection / Decrypt selection to clipboard. While the body is ciphertext the editor is read-only by design. |
 | File tree → **folder** | New private note (created in that folder, like native "New note") |
-| File tree (private or plain note) | Decrypt document (private note makes a plaintext copy; plain note decrypts all blocks in place) |
-| File tree (private note) | Unlock / Lock |
+| File tree (locked note) | Unlock and edit / Lock / Turn into a normal note; Decrypt document makes a plaintext copy |
+| File tree (plain Markdown note) | Lock this document in place; Decrypt document decrypts all blocks in place |
 | Reading-mode block / pill | Click → unlock dialog per configured method → show original |
 
 ---
@@ -139,17 +138,14 @@ TOTP QR codes are generated **locally** (never networked) for Authy / Google Aut
 
 ### What each unlock error means
 
-Errors are split by **actual cause**, never lumped into a generic "wrong password":
+Every rejected credential shows **one generic message** in every mode. Naming the failing factor would turn the dialog into an oracle: an attacker at your machine could confirm one credential and then focus on breaking the other — which is exactly what two-factor mode exists to prevent. The internal cause is still written to the console log for debugging.
 
-| You see | Actual cause | Next step |
+| You see | What it means | What to do |
 | --- | --- | --- |
-| TOTP code wrong | The code itself is wrong (changes every 30s, ±1 step tolerance) | Wait for a new code; if it fails every time, the local seed and authenticator differ — unlock with the recovery key and re-bind in Settings |
-| Code right, but doesn't match the vault key | Seed isn't the bound one, or the password changed | Unlock once with the recovery key, re-bind TOTP in Settings |
-| Code right, but password doesn't match | In combined mode, password or seed is wrong | No password-only tab to try; confirm both, else reset both with the recovery key |
-| Password wrong | The password is wrong | Unlock with the recovery key and reset the password in Settings |
-| Recovery key wrong | Copied wrong, or not this vault's key | Copy the grouped characters verbatim (spaces and dashes don't matter); if the backup is out of reach, use the password or an already-unlocked device |
-| "Enter a 6-digit code" | The field is empty | Fill it in — empty submits don't consume attempts |
-| No usable TOTP seed on this device | New computer, or local app data cleared | Unlock with the recovery key → Settings → "Restore local seed cache", paste the otpauth link (same seed, phone untouched); the dialog stays open so you can do it in place |
+| "Credential rejected…" | One or more of what you typed is wrong, or this device's seed/binding changed | Check your typing; if it keeps failing, unlock once with the recovery key, then re-bind the dynamic password / reset the password in Settings |
+| "Enter a 6-digit code" (or a missing field) | The field is empty | Fill it in — empty submits don't consume attempts |
+| "No usable TOTP seed on this device" | New computer, or local app data cleared | Unlock with the recovery key → Settings → "Restore local seed cache", paste the otpauth link (same seed, phone untouched); the dialog stays open so you can do it in place |
+| "Too many attempts, locked for …" | The rate-limit guard after repeated rejections | Wait it out, or unlock with the recovery key (a different tab still works once the guard allows) |
 
 Don't confuse three notices: **in the dialog** = can't get into the keyring; **top-right** "can't decrypt this note…" = in the keyring but this note's ciphertext won't open (recover from backup/file history); **top-right** raw error text = disk write failure (this path is fixed; it shouldn't appear again).
 
