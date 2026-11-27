@@ -10,6 +10,7 @@
  * that the user's secret actually unwraps the DEK before declaring success.
  */
 
+import { t } from "../i18n";
 import { App, TFile, normalizePath } from "obsidian";
 import { KeyCopy, NoteEnvelope, noteBodyState } from "../core/format";
 import {
@@ -122,7 +123,7 @@ export class VaultRecoveryService {
   /** Validate an existing keyring file against a candidate, to pick the right one. */
   async describeCandidate(candidate: RecoveryCandidate): Promise<string> {
     const slots = Object.keys(candidate.keyCopy.slots);
-    return `${candidate.file.path}（第 ${candidate.keyCopy.epoch} 代，含 ${slots.join(" / ")} 槽）`;
+    return t("recovery.candidateDesc", { path: candidate.file.path, epoch: candidate.keyCopy.epoch, slots: slots.join(" / ") });
   }
 
   static isKeyringPath(path: string): boolean {

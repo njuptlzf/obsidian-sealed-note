@@ -13,18 +13,18 @@ export class SealedNoteError extends Error {
 }
 
 export const Err = {
-  notInitialized: () =>
-    new SealedNoteError("E_NOT_INIT", "还没有设置主密码，请先完成初始化"),
-  locked: () =>
-    new SealedNoteError("E_LOCKED", "这篇笔记已锁定，需要先解锁"),
-  cancelled: () => new SealedNoteError("E_CANCELLED", "已取消"),
+  // Messages are resolved at THROW time (each factory calls t() when invoked),
+  // so a language switch takes effect without reloading the plugin.
+  notInitialized: () => new SealedNoteError("E_NOT_INIT", t("error.notInit")),
+  locked: () => new SealedNoteError("E_LOCKED", t("error.locked")),
+  cancelled: () => new SealedNoteError("E_CANCELLED", t("error.cancelled")),
   badEnvelope: (path?: string) =>
-    new SealedNoteError("E_BAD_ENVELOPE", "文件不是有效的加密笔记，或已被其他工具破坏", path),
+    new SealedNoteError("E_BAD_ENVELOPE", t("error.badEnvelope"), path),
   keyringMissing: () =>
-    new SealedNoteError("E_KEYRING_MISSING", "找不到密钥库，无法读取加密笔记"),
+    new SealedNoteError("E_KEYRING_MISSING", t("error.keyringMissing")),
   vaultMismatch: () =>
-    new SealedNoteError("E_VAULT_MISMATCH", "这篇笔记属于另一个保管库的密钥，无法解密"),
-  wrongSecret: () => new SealedNoteError("E_WRONG_SECRET", "密钥不正确"),
+    new SealedNoteError("E_VAULT_MISMATCH", t("error.vaultMismatch")),
+  wrongSecret: () => new SealedNoteError("E_WRONG_SECRET", t("error.wrongSecret")),
   weakPassword: (why: string) => new SealedNoteError("E_WEAK_PASSWORD", why),
   totpUnavailable: () =>
     new SealedNoteError(
@@ -44,11 +44,9 @@ export function describeError(error: unknown): string {
     // user's password by this point, so the honest explanation is different.
     if (error.name === "DecryptError") return t("error.decryptFailed");
     // Recognise the few browser errors worth translating.
-    if (/operation is insecure|subtle/i.test(error.message)) {
-      return "当前环境不支持 Web Crypto，无法加解密";
-    }
-    if (/not found|ENOENT/i.test(error.message)) return "文件不存在，可能已被移动或删除";
+    if (/operation is insecure|subtle/i.test(error.message)) return t("error.noWebCrypto");
+    if (/not found|ENOENT/i.test(error.message)) return t("error.fileMissing");
     return error.message;
   }
-  return "发生未知错误";
+  return t("error.unknown");
 }

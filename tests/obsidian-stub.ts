@@ -19,6 +19,8 @@ export interface Registered {
   domEvents: Array<{ type: string; fn: Function }>;
   viewSwitches: any[];
   activeLeafSwitches: any[];
+  cleanups: Function[];
+  editorExtensions: any[];
 }
 
 export interface Harness {
@@ -147,6 +149,8 @@ export function buildHarness(): { obsidian: any; harness: Harness } {
     domEvents: [],
     viewSwitches: [],
     activeLeafSwitches: [],
+    cleanups: [],
+    editorExtensions: [],
   };
 
   const files = new Map<string, string>();
@@ -352,6 +356,12 @@ export function buildHarness(): { obsidian: any; harness: Harness } {
     }
     registerEvent(ref: any) {
       return ref;
+    }
+    register(fn: Function) {
+      active().registered.cleanups.push(fn);
+    }
+    registerEditorExtension(exts: any) {
+      active().registered.editorExtensions.push(exts);
     }
     registerDomEvent(_target: any, type: string, fn: Function) {
       active().registered.domEvents.push({ type, fn });

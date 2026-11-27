@@ -17,6 +17,7 @@ import {
   wrapFenced,
 } from "../core/format";
 import { log } from "../util/log";
+import { t } from "../i18n";
 
 export interface InlineEncryptResult {
   payload: string;
@@ -37,7 +38,7 @@ export class EncryptionService {
 
   async decryptNote(dek: Uint8Array, envelopeText: string): Promise<string> {
     const envelope = parseNoteEnvelope(envelopeText);
-    if (!envelope) throw new Error("文件不是有效的加密笔记");
+    if (!envelope) throw new Error(t("error.badEnvelope"));
     return openNote(dek, this.vaultId(), envelope);
   }
 

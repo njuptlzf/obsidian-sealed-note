@@ -9,10 +9,11 @@
  */
 
 import { Notice } from "obsidian";
+import { t } from "../i18n";
 
 export class ClipboardService {
   async copy(text: string, opts: { label?: string } = {}): Promise<void> {
     await navigator.clipboard.writeText(text);
-    new Notice(`${opts.label ?? "已复制"}。剪贴板是共享的，用完记得清空。`, 5000);
+    new Notice(t("clipboard.copiedHint", { label: opts.label ?? t("clipboard.copied") }), 5000);
   }
 }

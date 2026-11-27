@@ -9,6 +9,7 @@ import { MarkdownPostProcessorContext, Notice } from "obsidian";
 import type SealedNotePlugin from "../main";
 import { openInline } from "../core/format";
 import { describeError } from "../util/errors";
+import { t } from "../i18n";
 
 const PAYLOAD_RE = /`?(sn1\.[A-Za-z0-9+/=]{40,})`?/g;
 
@@ -70,9 +71,10 @@ function buildPill(
 ): HTMLElement {
   const pill = document.createElement("span");
   pill.className = "sealed-pill";
-  pill.setText?.(`🔒 密文`);
-  pill.textContent = "🔒 密文";
-  pill.setAttribute("title", "点击解密");
+  const cipherLabel = t("menu.cipherPill");
+  pill.setText?.(cipherLabel);
+  pill.textContent = cipherLabel;
+  pill.setAttribute("title", t("menu.clickDecrypt"));
   pill.addEventListener("click", async (event) => {
     event.preventDefault();
     event.stopPropagation();
@@ -85,17 +87,17 @@ function buildPill(
       // Ctrl/Cmd click copies without ever painting the secret on screen.
       if (event.ctrlKey || event.metaKey) {
         await navigator.clipboard.writeText(plain);
-        new Notice("已复制到剪贴板（未显示在屏幕上）");
+        new Notice(t("notice.copiedSilently"));
         return;
       }
       pill.textContent = plain;
       pill.classList.add("is-revealed");
-      pill.setAttribute("title", "点击隐藏");
+      pill.setAttribute("title", t("menu.clickHide"));
       pill.onclick = null;
       pill.addEventListener("click", (e) => {
         e.preventDefault();
         if (pill.classList.contains("is-revealed")) {
-          pill.textContent = "🔒 密文";
+          pill.textContent = t("menu.cipherPill");
           pill.classList.remove("is-revealed");
         }
       });

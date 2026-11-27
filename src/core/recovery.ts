@@ -13,6 +13,7 @@
  * What it can NOT do: recover a password. Nothing can. See DESIGN.md.
  */
 
+import { t } from "../i18n";
 import { fromBase32, randomBytes, toBase32 } from "./crypto";
 import { normalizeRecovery } from "./keyring";
 
@@ -35,43 +36,8 @@ export function recoverySecret(raw: string): string {
 
 export function assertRecoveryKey(raw: string): void {
   const secret = recoverySecret(raw);
-  if (secret.length !== 52) throw new Error("恢复密钥长度不正确");
+  if (secret.length !== 52) throw new Error(t("error.recoveryLength"));
   // throws on illegal characters
   fromBase32(secret);
 }
 
-/** Human readable file the user is told to print or store in a password manager. */
-export function recoveryKeyText(opts: {
-  key: string;
-  vaultName: string;
-  fingerprint: string;
-  createdAt?: Date;
-}): string {
-  const when = (opts.createdAt ?? new Date()).toISOString().slice(0, 10);
-  return [
-    "Sealed Note — 恢复密钥",
-    "======================",
-    "",
-    `保管库：${opts.vaultName}`,
-    `生成日期：${when}`,
-    `密钥指纹：${opts.fingerprint}`,
-    "",
-    "恢复密钥（请逐字抄录或打印，不要拍照存相册）：",
-    "",
-    "    " + opts.key,
-    "",
-    "它能做什么",
-    "  · 忘记主密码时，用它重设主密码，笔记不会丢失",
-    "  · 在新设备上打开你的加密笔记",
-    "",
-    "它不能做什么",
-    "  · 不能找回你的主密码（任何工具都做不到）",
-    "  · 不能替代备份：如果文件本身丢了，钥匙也救不回内容",
-    "",
-    "保管建议",
-    "  · 打印一份放在实体安全处，或存进密码管理器",
-    "  · 不要放进同一个同步盘，否则等于把钥匙和锁放在一起",
-    "  · 任何拿到这串字符的人，都能打开你的加密笔记",
-    "",
-  ].join("\n");
-}

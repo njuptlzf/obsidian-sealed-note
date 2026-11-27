@@ -2,11 +2,7 @@
 
 import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type SealedNotePlugin from "../main";
-import { keyFingerprint, describeGuardWait, guardRemainingMs, SLOT_PASSWORD } from "../core/keyring";
-import { RecoveryKeyModal, SetupModal } from "./modals";
-import { generateRecoveryKey } from "../core/recovery";
-import { createKeyring } from "../core/keyring";
-import { newVaultId } from "../core/keyring";
+import { describeGuardWait, guardRemainingMs, SLOT_PASSWORD } from "../core/keyring";
 import { describeError } from "../util/errors";
 import { t, LANGUAGE_OPTIONS, setLanguage } from "../i18n";
 import type { Language } from "../i18n";
@@ -45,19 +41,10 @@ export class SealedNoteSettingTab extends PluginSettingTab {
       card.createEl("p", { text: t("settings.noKey"), cls: "sealed-hint" });
       const btn = card.createEl("button", { text: t("settings.setupNow"), cls: "mod-cta" });
       btn.addEventListener("click", async () => {
-        const result = await new Promise<{ password: string; hint: string } | null>((resolve) => {
-          new SetupModal(this.app, resolve).open();
-        });
-        if (!result) return;
-        const recovery = generateRecoveryKey();
-        const vaultId = newVaultId();
-        const { keyring, dek } = await createKeyring(vaultId, result.password, recovery, {
-          hint: result.hint || undefined,
-        });
-        await this.plugin.keyringStore.save(keyring);
-        (this.plugin as any).vaultIdentifier = vaultId;
-        const fp = await keyFingerprint(dek);
-        new RecoveryKeyModal(this.app, recovery, fp, this.app.vault.getName(), () => undefined).open();
+        // Use the real wizard: it registers the keyring in memory and lets the
+        // first note carry the key copy. The old inline path minted a keyring
+        // with no note to hold it, so it vanished on restart.
+        await this.plugin.setupFromSettings();
         this.display();
       });
       return;
@@ -70,9 +57,9 @@ export class SealedNoteSettingTab extends PluginSettingTab {
     // would imply a gap that is the whole point.
     const combinedMode = kr.totp.enabled && kr.totp.mode === "password+totp";
     const passwordDesc = kr.slots.password
-      ? `已设置 · 第 ${kr.slots.password.gen} 代`
+      ? t("settings.passwordSetGen", { gen: kr.slots.password.gen })
       : combinedMode
-        ? "严格双因子：密码只与动态码组合使用，无独立密码通道"
+        ? t("settings.strictCombined")
         : t("settings.notSet");
 
     new Setting(card)
@@ -116,8 +103,8 @@ export class SealedNoteSettingTab extends PluginSettingTab {
     };
     const mode = kr.totp.mode ?? "password";
     const totpDesc = kr.totp.enabled
-      ? `当前模式：${modeLabels[mode] ?? mode}。种子只保存在你的验证器 App 里。`
-      : `未启用。当前模式：${modeLabels[mode] ?? mode}`;
+      ? t("settings.currentMode", { mode: modeLabels[mode] ?? mode })
+      : t("settings.modeOff", { mode: modeLabels[mode] ?? mode });
 
     new Setting(card)
       .setName(t("settings.modeSwitch"))
@@ -176,7 +163,7 @@ export class SealedNoteSettingTab extends PluginSettingTab {
 
     const wait = guardRemainingMs(kr.guard);
     if (wait > 0) {
-      card.createEl("p", { text: `正在限流中：${describeGuardWait(wait)}`, cls: "sealed-error" });
+      card.createEl("p", { text: t("status.rateLimited", { wait: describeGuardWait(wait) }), cls: "sealed-error" });
     }
 
     new Setting(card)
@@ -289,7 +276,7 @@ export class SealedNoteSettingTab extends PluginSettingTab {
         btn.setButtonText(t("common.lock")).onClick(() => {
           const count = this.plugin.unlockService.lockAll();
           this.plugin.refreshStatusBar();
-          new Notice(count ? `已锁定 ${count} 篇` : t("status.noneUnlocked2"));
+          new Notice(count ? t("notice.lockedN", { n: count }) : t("status.noneUnlocked2"));
         }),
       );
   }

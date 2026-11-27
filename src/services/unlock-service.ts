@@ -33,24 +33,25 @@ import { deviceKeyStorageAvailable, sealWithDevice, openWithDevice } from "../co
 import { Err, SealedNoteError, describeError } from "../util/errors";
 
 /**
- * What to tell the user for each way a credential can fail.
+ * What to tell the user when a credential fails.
  *
- * One sentence per cause, each ending in the action that actually fixes it.
- * Collapsing them into "incorrect, try again" is what made a user with a
- * correct dynamic code keep retyping it while the real cause was a stale seed.
+ * Deliberately ONE message for every rejected credential, in every mode.
+ * Naming the failing factor ("the code is right, the password is wrong")
+ * turns the dialog into an oracle: anyone at this machine can confirm one
+ * factor and then focus on breaking the other - which is exactly what
+ * two-factor mode exists to prevent. The message still ends in the action
+ * that fixes the realistic benign causes (typo, stale seed, rotated
+ * binding) without saying which one applied: use the recovery tab, rebind.
+ * The internal reason survives in the console log for debugging.
  */
 function describeFailure(reason: UnlockFailureReason | undefined, fallback: string): string {
   switch (reason) {
     case "wrong-code":
-      return t("unlock.wrongCode");
     case "wrong-password":
-      return t("unlock.wrongPassword");
     case "wrong-recovery":
-      return t("unlock.wrongRecovery");
     case "key-mismatch":
-      return t("unlock.keyMismatch");
     case "combined-mismatch":
-      return t("unlock.combinedMismatch");
+      return t("unlock.wrongCredential");
     default:
       return fallback;
   }
@@ -109,12 +110,28 @@ export class UnlockService {
     return this.uiFactory();
   }
 
+  /**
+   * A freshly created note is revealed immediately, so its envelope (the only
+   * on-disk key copy) is gone until the first lock. Keep the keyring in memory
+   * for exactly that window; otherwise hasKeyring() reports "not initialized"
+   * and the settings page hides the recovery key right after setup.
+   */
+  private memoryKeyring: KeyringData | null = null;
+
+  rememberKeyring(kr: KeyringData): void {
+    this.memoryKeyring = kr;
+  }
+
+  hasKeyringLoaded(): boolean {
+    return this.memoryKeyring !== null;
+  }
+
   async keyring(): Promise<KeyringData | null> {
-    return this.keyringStore.load();
+    return (await this.keyringStore.load()) ?? this.memoryKeyring;
   }
 
   async requireKeyring(): Promise<KeyringData> {
-    const kr = await this.keyringStore.load();
+    const kr = (await this.keyringStore.load()) ?? this.memoryKeyring;
     if (!kr) throw Err.notInitialized();
     return kr;
   }
@@ -200,7 +217,7 @@ export class UnlockService {
 
     for (;;) {
       const wait = guardRemainingMs(kr.guard);
-      if (wait > 0) throw new Error(`尝试次数过多，${describeGuardWait(wait)}`);
+      if (wait > 0) throw new Error(t("error.rateLimited", { wait: describeGuardWait(wait) }));
 
       this.signalBusy("idle");
       const answer = await this.ui.prompt({ subject, providers: available, provider, error: lastError, verb });
@@ -348,9 +365,7 @@ export class UnlockService {
       // A password mode without a password door would be unrecoverable except
       // via the recovery key; refuse before touching anything.
       if (!opts.password && !kr.slots[SLOT_PASSWORD]) {
-        throw new Error(
-          "切换为纯密码模式需要先设置一个主密码（当前保管库没有独立的密码通道）。",
-        );
+        throw new Error(t("unlock.switchPasswordNeeds"));
       }
       delete kr.slots[SLOT_TOTP];
       delete kr.slots[SLOT_PASSWORD_TOTP];
@@ -371,7 +386,7 @@ export class UnlockService {
       kr.totp.seedRef = (await sealWithDevice(kr.vaultId, seed)) ?? undefined;
       await setSlot(kr, dek, SLOT_TOTP, credentialFor(SLOT_TOTP, { totpSeed: seed }));
     } else {
-      if (!opts.password || !opts.seed) throw new Error("需要主密码和动态密码种子");
+      if (!opts.password || !opts.seed) throw new Error(t("error.missingBoth"));
       const seed = normalizeSeed(opts.seed);
       this.sessionTotpSeed = seed;
       delete kr.slots[SLOT_TOTP];
@@ -415,7 +430,7 @@ export class UnlockService {
     const kr = await this.requireKeyring();
     if (!kr.slots[SLOT_PASSWORD]) return; // already strict
     if (!kr.totp.enabled || kr.totp.mode !== "password+totp" || !kr.slots[SLOT_PASSWORD_TOTP]) {
-      throw new Error("只有「主密码 + 动态密码」模式才需要收口单密码通道。");
+      throw new Error(t("settings.hardenOnlyCombined"));
     }
     // The combined door must be usable AFTER the old one goes away: a sealed
     // seed on this device is what makes the next unlock possible.
@@ -426,7 +441,7 @@ export class UnlockService {
     await this.keyringStore.save(kr);
     const after = await this.keyringStore.load();
     if (!after?.slots[SLOT_PASSWORD_TOTP] || after.slots[SLOT_PASSWORD]) {
-      throw new Error("收口后的密钥副本异常（组合槽丢失或密码槽仍在），请重试。");
+      throw new Error(t("error.hardenVerify"));
     }
     this.log.info("combined_mode_hardened", { epoch: kr.epoch });
   }
@@ -434,9 +449,7 @@ export class UnlockService {
   async disableTotp(): Promise<void> {
     const kr = await this.requireKeyring();
     if (!kr.slots[SLOT_PASSWORD] && kr.slots[SLOT_PASSWORD_TOTP]) {
-      throw new Error(
-        "当前是严格双因子模式（没有单独密码通道）。请先切到「纯密码」模式设置一个主密码，再关闭动态密码。",
-      );
+      throw new Error(t("settings.strictNoPasswordChannel"));
     }
     delete kr.slots[SLOT_TOTP];
     delete kr.slots[SLOT_PASSWORD_TOTP];
@@ -463,9 +476,7 @@ export class UnlockService {
     if (combined) {
       const seed = this.sessionTotpSeed ?? (await this.localSeed(kr));
       if (!seed) {
-        throw new Error(
-          "本机没有可用的动态密码种子，无法改密码。先用恢复密钥完成一次解锁，或在设置「恢复本机种子缓存」导入 otpauth 链接后重试。",
-        );
+        throw new Error(t("error.seedMissingForChange"));
       }
       this.sessionTotpSeed = seed;
       await setSlot(
@@ -477,9 +488,7 @@ export class UnlockService {
     } else if (kr.slots[SLOT_PASSWORD]) {
       await setSlot(kr, dek, SLOT_PASSWORD, credentialFor(SLOT_PASSWORD, { password: newPassword }));
     } else {
-      throw new Error(
-        "当前模式没有单独的主密码通道，请改用「设置解锁方式」来更换密码。",
-      );
+      throw new Error(t("settings.noStandalonePassword"));
     }
     kr.epoch = (kr.epoch ?? 0) + 1;
     await this.keyringStore.save(kr);
@@ -562,10 +571,10 @@ function normalizeSeed(input: string): string {
     try {
       const url = new URL(clean);
       const secret = url.searchParams.get("secret");
-      if (!secret) throw new Error("otpauth 链接里没有 secret");
+      if (!secret) throw new Error(t("error.otpauthNoSecret"));
       return secret.toUpperCase().replace(/[^A-Z2-7]/g, "");
     } catch (error) {
-      throw new Error("无法解析 otpauth 链接：" + String(error));
+      throw new Error(t("error.otpauthParse", { error: String(error) }));
     }
   }
   return clean.toUpperCase().replace(/[^A-Z2-7]/g, "");

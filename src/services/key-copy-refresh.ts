@@ -15,6 +15,7 @@
  * Normal markdown files are never opened or modified.
  */
 
+import { t } from "../i18n";
 import { App, TFile } from "obsidian";
 import { KeyringData, keyCopyFromKeyringData, parseKeyring } from "../core/keyring";
 import { keyCopiesEqual, noteBodyState } from "../core/format";
@@ -77,7 +78,7 @@ export class KeyCopyRefreshService {
         const envelope = await this.notes.tryReadEnvelope(file);
         if (!envelope) {
           result.failed++;
-          result.failures.push(`${file.path}: 不是有效的加密笔记`);
+          result.failures.push(t("refresh.notValid", { path: file.path }));
           continue;
         }
         if (!envelope.keys) {

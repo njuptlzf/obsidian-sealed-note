@@ -487,10 +487,10 @@ test("recovery key: shape, uniqueness, normalization", () => {
 });
 
 test("recovery key: bad input is refused", () => {
-  assert.throws(() => assertRecoveryKey("too-short"), /长度不正确/);
+  assert.throws(() => assertRecoveryKey("too-short"), /wrong length|长度不正确/);
   // Characters outside the base32 alphabet are stripped by normalization, so a
   // string made only of them collapses to zero length and is refused.
-  assert.throws(() => assertRecoveryKey("1".repeat(52)), /长度不正确/);
+  assert.throws(() => assertRecoveryKey("1".repeat(52)), /wrong length|长度不正确/);
   // 52 valid base32 chars but not a multiple of 8 at the bit level still decodes,
   // so the length gate is what protects us here.
   assert.doesNotThrow(() => assertRecoveryKey("A".repeat(52)));
@@ -760,4 +760,161 @@ test("i18n: unknown key falls back to the key itself, never throws", async () =>
   setLanguage("en");
   assert.equal(t("this.key.does.not.exist"), "this.key.does.not.exist");
   assert.equal(t("notice.created", { unused: "x" }), t("notice.created"));
+});
+
+/* ------------------------------------------------------------------ */
+/* ciphertext guard (real CodeMirror, no browser)                      */
+/* ------------------------------------------------------------------ */
+
+test("guard: isSealedDocText recognises both envelope forms", async () => {
+  const { isSealedDocText } = await import("../src/editor/ciphertext-guard");
+  assert.equal(isSealedDocText('<!-- sealed-note/note/1\n{\n  "format": "sealed-note/note/1"\n}\n-->'), true);
+  assert.equal(isSealedDocText('{"format":"sealed-note/note/1","kid":"x"}'), true);
+  assert.equal(isSealedDocText("# normal note\n\nplain text"), false);
+  assert.equal(isSealedDocText(""), false);
+  // Leading whitespace must not defeat the check.
+  assert.equal(isSealedDocText("\n  <!-- sealed-note/note/1\n{}"), true);
+});
+
+test("guard: a user-event change to an envelope is refused, a programmatic one passes", async () => {
+  const { ciphertextGuard } = await import("../src/editor/ciphertext-guard");
+  const { EditorState, Transaction } = await import("@codemirror/state");
+  const envelope = '<!-- sealed-note/note/1\n{"format":"sealed-note/note/1"}\n-->';
+
+  const state = EditorState.create({ doc: envelope, extensions: ciphertextGuard() });
+
+  // Simulate typing: CM's DOM bridge tags such transactions with a userEvent.
+  const typed = state.update({
+    changes: { from: 10, to: 11, insert: "X" },
+    annotations: Transaction.userEvent.of("input.delete"),
+  });
+  assert.equal(typed.docChanged, false, "the keystroke never reaches the document");
+  assert.equal(typed.state.doc.toString(), envelope, "envelope byte-for-byte intact");
+
+  // Undo is a user event too.
+  const undone = state.update({
+    changes: { from: 0, to: 5 },
+    annotations: Transaction.userEvent.of("undo"),
+  });
+  assert.equal(undone.docChanged, false, "undo cannot rewrite ciphertext");
+
+  // The reveal path (vault.modify -> buffer sync) carries no user event.
+  const revealed = state.update({ changes: { from: 0, to: envelope.length, insert: "plaintext body" } });
+  assert.equal(revealed.docChanged, true, "programmatic replacement passes");
+  assert.equal(revealed.state.doc.toString(), "plaintext body");
+
+  // Once plaintext, user edits are free again.
+  const typed2 = revealed.state.update({
+    changes: { from: 0, insert: "more " },
+    annotations: Transaction.userEvent.of("input"),
+  });
+  assert.equal(typed2.docChanged, true, "plaintext notes are fully editable");
+});
+
+test("guard: plain notes are untouched by the filter", async () => {
+  const { ciphertextGuard } = await import("../src/editor/ciphertext-guard");
+  const { EditorState, Transaction } = await import("@codemirror/state");
+  const state = EditorState.create({ doc: "# title\n", extensions: ciphertextGuard() });
+  const tr = state.update({
+    changes: { from: 0, insert: "x" },
+    annotations: Transaction.userEvent.of("input"),
+  });
+  assert.equal(tr.docChanged, true, "typing into a plain note works");
+});
+
+/* ------------------------------------------------------------------ */
+/* explorer badges (pure DOM helper against a hand-built tree)         */
+/* ------------------------------------------------------------------ */
+
+test("badges: applyExplorerBadges adds, keeps and removes lock spans", async () => {
+  const { applyExplorerBadges } = await import("../src/notes/explorer-badges");
+
+  const makeTitle = (path: string): any => {
+    const children: any[] = [];
+    const content: any = { className: "nav-file-title-content", parent: null };
+    const el: any = {
+      dataset: { path },
+      get firstChild() { return children[0] ?? null; },
+      children,
+      querySelector(sel: string) {
+        if (sel === ".sealed-nav-lock") return children.find((c) => c.className === "sealed-nav-lock") ?? null;
+        if (sel === ".nav-file-title-content") return content;
+        return null;
+      },
+      insertBefore(node: any, ref: any) {
+        const idx = ref ? children.indexOf(ref) : children.length;
+        children.splice(idx < 0 ? children.length : idx, 0, node);
+        node.parent = el;
+        return node;
+      },
+    };
+    children.push(content);
+    return el;
+  };
+  const root: any = {
+    titles: [] as any[],
+    querySelectorAll(sel: string) {
+      return sel === ".nav-file-title" ? this.titles : [];
+    },
+  };
+  const sealed = makeTitle("life/secret.sealed.md");
+  const plain = makeTitle("life/normal.md");
+  root.titles.push(sealed, plain);
+
+  const g = globalThis as any;
+  const prevCreate = g.document?.createElement;
+  if (!g.document) g.document = {};
+  g.document.createElement = () => {
+    const el: any = { className: "", textContent: "", setAttribute() {}, children: [], parent: null };
+    el.remove = () => {
+      const p2 = el.parent;
+      if (p2) p2.children = p2.children.filter((c: any) => c !== el);
+    };
+    return el;
+  };
+
+  applyExplorerBadges(root, new Set(["life/secret.sealed.md"]));
+  assert.equal(sealed.children.length, 2, "badge inserted for the sealed note");
+  assert.equal(sealed.children[0].className, "sealed-nav-lock", "badge is the FIRST child");
+  assert.equal(plain.children.length, 1, "plain note untouched");
+
+  // Idempotent: a second pass adds nothing.
+  applyExplorerBadges(root, new Set(["life/secret.sealed.md"]));
+  assert.equal(sealed.children.length, 2, "second pass adds no duplicate");
+
+  // Demotion removes the badge.
+  applyExplorerBadges(root, new Set());
+  assert.equal(sealed.children.length, 1, "badge removed once the note is plain");
+
+  g.document.createElement = prevCreate;
+});
+
+test("i18n: no user-facing Chinese string literals outside i18n.ts (regression guard)", async () => {
+  // Parsing TS comments correctly is a whole grammar; this guard errs on the
+  // side of catching real literals. Comments contain Chinese, so only lines
+  // whose code (before //) has a quoted Chinese literal count.
+  const { readFileSync, readdirSync, statSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const root = join(process.cwd(), "src");
+  const files: string[] = [];
+  const walk = (dir: string) => {
+    for (const name of readdirSync(dir)) {
+      const full = join(dir, name);
+      if (statSync(full).isDirectory()) walk(full);
+      else if (name.endsWith(".ts") && !name.endsWith(".d.ts")) files.push(full);
+    }
+  };
+  walk(root);
+  const offenders: string[] = [];
+  for (const file of files) {
+    if (file.endsWith("i18n.ts")) continue;
+    const text = readFileSync(file, "utf8");
+    text.split("\n").forEach((line, i) => {
+      const code = line.split("//")[0]; // ignore comment text
+      if (/["'`][^"'`]*[\u4e00-\u9fff][^"'`]*["'`]/.test(code)) {
+        offenders.push(`${file.replace(root, "src")}:${i + 1}: ${line.trim()}`);
+      }
+    });
+  }
+  assert.deepEqual(offenders, [], `hardcoded user-facing text:/n${offenders.join("/n")}`);
 });

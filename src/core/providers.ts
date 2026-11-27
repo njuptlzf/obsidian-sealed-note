@@ -24,6 +24,7 @@ import {
   unlockFromCredential,
 } from "./keyring";
 import { verifyTotp } from "./totp";
+import { t } from "../i18n";
 
 /**
  * Try a credential against the keyring, translating the generic "no slot
@@ -85,19 +86,19 @@ export function needsCode(id: ProviderId): boolean {
 
 export class PasswordProvider implements UnlockProvider {
   readonly id = "password" as const;
-  readonly label = "主密码";
-  readonly hint = "输入你的主密码";
-  readonly fields: ProviderField[] = [
-    { key: "secret", label: "主密码", kind: "password", placeholder: "主密码" },
-  ];
-  readonly caution = "主密码不会保存在任何设备上，也不会被同步。";
+  get label() { return t("provider.password.label"); }
+  get hint() { return t("provider.password.hint"); }
+  get fields(): ProviderField[] {
+    return [{ key: "secret", label: t("provider.password.label"), kind: "password", placeholder: t("provider.password.placeholder") }];
+  }
+  get caution() { return t("provider.password.caution"); }
 
   isConfigured(kr: KeyringData): boolean {
     return !!kr.slots[SLOT_PASSWORD];
   }
 
     async unlock(kr: KeyringData, attempt: UnlockAttempt): Promise<Uint8Array> {
-      if (!attempt.secret) throw new UnlockError("请输入主密码", false, "incomplete");
+      if (!attempt.secret) throw new UnlockError(t("error.missingPassword"), false, "incomplete");
       return openWith(kr, credentialFor(SLOT_PASSWORD, { password: attempt.secret }), "wrong-password");
     }
 }
@@ -108,22 +109,21 @@ export class PasswordProvider implements UnlockProvider {
  */
 export class TotpProvider implements UnlockProvider {
   readonly id = "totp" as const;
-  readonly label = "动态密码";
-  readonly hint = "输入身份验证器里的 6 位数字，并导入该验证器的 otpauth 链接";
-  readonly fields: ProviderField[] = [
-    { key: "code", label: "6 位验证码", kind: "text", placeholder: "000000", numeric: true, maxLength: 6 },
-  ];
-  readonly caution =
-    "密钥材料是验证器里的种子，不是这 6 位数字。换设备时从验证器导出 otpauth 链接导入即可。";
+  get label() { return t("provider.totp.label"); }
+  get hint() { return t("provider.totp.hint"); }
+  get fields(): ProviderField[] {
+    return [{ key: "code", label: t("provider.totp.codeLabel"), kind: "text", placeholder: "000000", numeric: true, maxLength: 6 }];
+  }
+  get caution() { return t("provider.totp.caution"); }
 
   isConfigured(kr: KeyringData): boolean {
     return !!kr.slots[SLOT_TOTP] && kr.totp.enabled;
   }
 
     async unlock(kr: KeyringData, attempt: UnlockAttempt): Promise<Uint8Array> {
-      if (!attempt.code) throw new UnlockError("请输入 6 位动态密码", false, "incomplete");
+      if (!attempt.code) throw new UnlockError(t("error.missingSeed"), false, "incomplete");
       const seed = attempt.totpSeed;
-      if (!seed) throw new UnlockError("请先导入验证器的 otpauth 链接", false, "incomplete");
+      if (!seed) throw new UnlockError(t("provider.totp.hint"), false, "incomplete");
       const ok = await verifyTotp(seed, attempt.code, {
         digits: kr.totp.digits,
         step: kr.totp.period,
@@ -139,23 +139,25 @@ export class TotpProvider implements UnlockProvider {
 /** Password + TOTP. Both are folded into one KEK with domain separation. */
 export class PasswordTotpProvider implements UnlockProvider {
   readonly id = "password+totp" as const;
-  readonly label = "密码 + 动态密码";
-  readonly hint = "先输入主密码，再输入身份验证器里的 6 位数字";
-  readonly fields: ProviderField[] = [
-    { key: "secret", label: "主密码", kind: "password", placeholder: "主密码" },
-    { key: "code", label: "6 位验证码", kind: "text", placeholder: "000000", numeric: true, maxLength: 6 },
-  ];
-  readonly caution = "两把钥匙缺一不可，此模式没有单独的密码通道。换设备时用恢复密钥进入，再导入 otpauth 链接恢复种子。";
+  get label() { return t("provider.combined.label"); }
+  get hint() { return t("provider.combined.hint"); }
+  get fields(): ProviderField[] {
+    return [
+      { key: "secret", label: t("provider.password.label"), kind: "password", placeholder: t("provider.password.placeholder") },
+      { key: "code", label: t("provider.totp.codeLabel"), kind: "text", placeholder: "000000", numeric: true, maxLength: 6 },
+    ];
+  }
+  get caution() { return t("provider.combined.caution"); }
 
   isConfigured(kr: KeyringData): boolean {
     return !!kr.slots[SLOT_PASSWORD_TOTP] && kr.totp.enabled;
   }
 
     async unlock(kr: KeyringData, attempt: UnlockAttempt): Promise<Uint8Array> {
-      if (!attempt.secret) throw new UnlockError("请输入主密码", false, "incomplete");
-      if (!attempt.code) throw new UnlockError("请输入 6 位动态密码", false, "incomplete");
+      if (!attempt.secret) throw new UnlockError(t("error.missingPassword"), false, "incomplete");
+      if (!attempt.code) throw new UnlockError(t("error.missingSeed"), false, "incomplete");
       const seed = attempt.totpSeed;
-      if (!seed) throw new UnlockError("请先导入验证器的 otpauth 链接", false, "incomplete");
+      if (!seed) throw new UnlockError(t("provider.totp.hint"), false, "incomplete");
       const ok = await verifyTotp(seed, attempt.code, {
         digits: kr.totp.digits,
         step: kr.totp.period,
@@ -174,19 +176,19 @@ export class PasswordTotpProvider implements UnlockProvider {
 /** Recovery key always works, independent of the configured mode. */
 export class RecoveryProvider implements UnlockProvider {
   readonly id = "recovery" as const;
-  readonly label = "恢复密钥";
-  readonly hint = "输入恢复密钥，大小写、空格和连字符都可忽略";
-  readonly fields: ProviderField[] = [
-    { key: "secret", label: "恢复密钥", kind: "text", placeholder: "XXXXX-XXXXX-XXXXX-…" },
-  ];
-  readonly caution = "恢复密钥只能重设密码，不能找回密码。";
+  get label() { return t("provider.recovery.label"); }
+  get hint() { return t("provider.recovery.hint"); }
+  get fields(): ProviderField[] {
+    return [{ key: "secret", label: t("provider.recovery.label"), kind: "text", placeholder: "XXXXX-XXXXX-XXXXX-…" }];
+  }
+  get caution() { return t("provider.recovery.caution"); }
 
   isConfigured(kr: KeyringData): boolean {
     return !!kr.slots[SLOT_RECOVERY];
   }
 
     async unlock(kr: KeyringData, attempt: UnlockAttempt): Promise<Uint8Array> {
-      if (!attempt.secret) throw new UnlockError("请输入恢复密钥", false, "incomplete");
+      if (!attempt.secret) throw new UnlockError(t("error.missingRecovery"), false, "incomplete");
       return openWith(
         kr,
         credentialFor(SLOT_RECOVERY, { recovery: attempt.secret }),

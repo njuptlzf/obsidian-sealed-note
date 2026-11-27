@@ -35,7 +35,7 @@ export class CandidatePickerModal extends Modal {
       item.createEl("div", { text: candidate.file.path, cls: "sealed-candidate-path" });
       const slots = Object.keys(candidate.keyCopy.slots);
       item.createEl("div", {
-        text: `第 ${candidate.keyCopy.epoch} 代 · 含 ${slots.join(" / ")} 槽`,
+        text: t("recovery.epochSlots", { epoch: candidate.keyCopy.epoch, slots: slots.join(" / ") }),
         cls: "sealed-hint",
       });
       const btn = item.createEl("button", { text: t("picker.use"), cls: "mod-cta" });

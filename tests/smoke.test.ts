@@ -71,6 +71,9 @@ function installDomShim(): void {
       },
       createTreeWalker: () => ({ nextNode: () => null }),
       querySelector: () => null,
+      // CodeMirror probes documentElement.style at module init for browser
+      // detection; without this the real plugin import throws headless.
+      documentElement: { style: {}, classList: { add() {}, remove() {} } },
       body,
     };
   }
@@ -153,20 +156,22 @@ test("onload registers views, commands, menus and chrome without throwing", asyn
     "decrypt-whole-note",
     "lock-current",
     "lock-all",
+    "lock-document",
     "show-recovery-key",
     "setup-totp",
   ];
   for (const id of expected) assert.ok(ids.includes(id), `missing command: ${id}`);
   assert.equal(new Set(ids).size, ids.length, "command ids must be unique");
 
-  assert.ok(r.views.has("sealed-note-view"), "sealed view registered");
-  assert.equal(r.extensions.get("sealed"), "sealed-note-view", "the 'sealed' token routes .sealed.md to the padlock view");
+  assert.ok(!r.views.has("sealed-note-view"), "no custom padlock view is registered");
+  assert.ok(!r.extensions.has("sealed"), "sealed notes open in the native Markdown editor");
   assert.ok(r.events.some((e) => e.name === "file-open"), "file-open hook present for stale-tab cleanup");
 
   for (const lang of ["encrypted_txt", "txt_encrypted", "sealed"]) {
     assert.ok(r.codeBlocks.has(lang), `code block processor for ${lang}`);
   }
-  assert.equal(r.postProcessors.length, 1, "inline postprocessor registered");
+  assert.equal(r.postProcessors.length, 2, "inline payloads and locked-note marker registered");
+  assert.equal(r.editorExtensions.length, 1, "ciphertext guard editor extension registered");
 
   assert.ok(r.events.some((e) => e.name === "editor-menu"), "editor context menu");
   assert.ok(r.events.some((e) => e.name === "file-menu"), "file context menu");
@@ -890,7 +895,7 @@ test("configureMode for all three modes writes matching slots", async () => {
 
   // pure password mode clears totp; after totp-only there is no password door,
   // so switching must supply the new password explicitly (guard below).
-  await assert.rejects(() => plugin.unlockService.configureMode(dek, "password"), /需要先设置一个主密码/);
+  await assert.rejects(() => plugin.unlockService.configureMode(dek, "password"), /master password first|需要先设置一个主密码/);
   await plugin.unlockService.configureMode(dek, "password", { password: "pw-1234567890" });
   kr = await plugin.unlockService.requireKeyring();
   assert.equal(kr.totp.enabled, false);
@@ -1497,7 +1502,7 @@ test("legacy working copies are removed and revealed notes are recovered on load
   // the credential and the typed text stays exactly where the user left it.
   assert.ok(harness.files.get(file.path)!.includes("secret-xyz"), "boot leaves the body alone");
   assert.ok(
-    harness.notices.some((n) => n.includes("明文状态")),
+    harness.notices.some((n) => /plaintext|明文状态/i.test(n)),
     "the user is told about the leftover plaintext",
   );
 
@@ -1647,25 +1652,26 @@ test("unlocking never switches a sidebar leaf", async () => {
   plugin.unlockService.dekFor = async () => dek;
   const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/side", "侧边");
 
-  // The note's tab is a padlock leaf; the ACTIVE leaf is the file explorer.
-  const sealedSwitches: string[] = [];
-  const sealedLeaf = {
-    view: { getViewType: () => "sealed-note-view", file: { path: file.path } },
-    setViewState: async (s: any) => { sealedSwitches.push(`${file.path}->${s.type}`); },
+  // Sealed notes are ordinary Markdown files. The ACTIVE leaf is the file
+  // explorer; another main-area markdown leaf already shows the note.
+  const switches: string[] = [];
+  const noteLeaf = {
+    view: { getViewType: () => "markdown", file: { path: file.path } },
+    setViewState: async (s: any) => { switches.push(`${file.path}->${s.type}`); },
   };
-  harness.app.workspace.sealedLeaves = [sealedLeaf];
+  harness.app.workspace.markdownLeaves = [noteLeaf];
   harness.app.workspace.activeLeafIsSide = true;
   assert.equal((plugin as any).isSideLeaf(harness.app.workspace.activeLeaf), true, "stub detects side leaf");
 
   await plugin.unlockNote(file);
 
   assert.equal(harness.files.get(file.path), "", "body revealed as bare plaintext, no annotation");
-  assert.deepEqual(sealedSwitches, [`${file.path}->markdown`], "the note's own leaf switched to markdown");
+  assert.deepEqual(switches, [], "the existing markdown leaf is reused, never re-switched");
   assert.equal(harness.registered.activeLeafSwitches.length, 0, "sidebar leaf was NOT used");
   plugin.onunload();
 });
 
-test("opening a sealed note switches only its own leaf to the padlock, not other tabs", async () => {
+test("opening a sealed note does not switch any leaf to a custom view", async () => {
   const { plugin, harness } = await boot();
   const fileOpen = harness.registered.events.find((e) => e.name === "file-open");
   assert.ok(fileOpen, "file-open hook registered");
@@ -1690,11 +1696,11 @@ test("opening a sealed note switches only its own leaf to the padlock, not other
   fileOpen!.fn(file);
   await new Promise((resolve) => setTimeout(resolve, 20));
 
-  assert.deepEqual(switched, [`${file.path}->sealed-note-view`], "only the sealed note's leaf is switched");
+  assert.deepEqual(switched, [], "sealed notes stay in the native Markdown editor");
   plugin.onunload();
 });
 
-test("v2: renaming a private note without .sealed.md restores the suffix; ciphertext travels with it", async () => {
+test("v2: renaming a locked note keeps the chosen filename and carries the ciphertext", async () => {
   const { plugin, harness } = await boot();
   const { createKeyring } = await import("../src/core/keyring");
   const { generateRecoveryKey } = await import("../src/core/recovery");
@@ -1712,18 +1718,17 @@ test("v2: renaming a private note without .sealed.md restores the suffix; cipher
   const renameHook = harness.registered.events.find((e) => e.name === "vault:rename");
   assert.ok(renameHook, "rename hook registered");
 
-  // User renames to "summary.md" (drops .sealed). Simulate vault rename + event.
+  // User renames to "summary.md" (drops .sealed). The plugin must NOT rename it
+  // back: locked notes are recognised by content and registry, not by suffix.
   harness.files.delete(file.path);
   harness.files.set("Private/summary.md", lockedBody);
   await renameHook!.fn({ path: "Private/summary.md", basename: "summary", extension: "md" }, file.path);
-  for (let i = 0; i < 50 && !harness.files.has("Private/summary.sealed.md"); i++) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
 
-  assert.ok(harness.files.has("Private/summary.sealed.md"), "suffix restored automatically");
-  assert.equal(harness.files.has("Private/summary.md"), false, "old no-suffix path gone");
+  assert.ok(harness.files.has("Private/summary.md"), "the filename the user chose is kept");
+  assert.equal(harness.files.has("Private/summary.sealed.md"), false, "no suffix forced back");
+  assert.equal(plugin.notes.isSealedPath("Private/summary.md"), true, "registry follows the rename");
   assert.equal(
-    await plugin.notes.readPlaintext({ path: "Private/summary.sealed.md" } as any, dek, vaultId),
+    await plugin.notes.readPlaintext({ path: "Private/summary.md" } as any, dek, vaultId),
     "",
     "ciphertext followed the rename with no sidecar to rewire",
   );
@@ -1931,7 +1936,7 @@ async function totpOnlyService(plugin: any, vaultId: string) {
   return { keyring, dek, seed };
 }
 
-test("a wrong dynamic code is called a wrong code, and says what to do", async () => {
+test("a rejected credential never says WHICH part failed (no 2FA oracle)", async () => {
   const { plugin } = await boot();
   const { setLanguage } = await import("../src/i18n");
   setLanguage("zh"); // assert the wording the user actually reads
@@ -1949,21 +1954,23 @@ test("a wrong dynamic code is called a wrong code, and says what to do", async (
   assert.equal(await plugin.unlockService.dekFor("note-a.md"), null);
   assert.equal(seen.length, 2, "the dialog stays open and asks again");
   const msg = seen[1].error as string;
-  assert.match(msg, /动态密码不对/, "names the actual cause");
-  assert.match(msg, /主密码/, "tells the user the way out");
-  assert.ok(!/^.*不正确，请重试$/.test(msg), "not the old generic 'wrong, try again'");
+  assert.match(msg, /凭据不正确/, "a single generic rejection wording");
+  assert.match(msg, /恢复密钥/, "still points at the way out");
+  assert.ok(!/动态密码不对|主密码不对|恢复密钥不对/.test(msg), "names no specific credential");
+  assert.ok(!/是对的/.test(msg), "never confirms any part as correct");
   setLanguage("en");
   plugin.onunload();
 });
 
-test("a correct dynamic code that does not match the key says exactly that", async () => {
+test("a correct code with a mismatched key gets the SAME message as a wrong code", async () => {
   const { plugin } = await boot();
   const { setLanguage } = await import("../src/i18n");
   setLanguage("zh");
-  const { seed } = await totpOnlyService(plugin, "fa020000-2222-4333-8444-555555555555");
+  await totpOnlyService(plugin, "fa020000-2222-4333-8444-555555555555");
   const { generateTotpSecret, totpCode } = await import("../src/core/totp");
 
   // A different, perfectly valid seed: the code verifies, the key does not open.
+  // The UI must not reveal that the code was the correct half.
   const otherSeed = generateTotpSecret();
   const code = await totpCode(otherSeed);
 
@@ -1971,17 +1978,14 @@ test("a correct dynamic code that does not match the key says exactly that", asy
   plugin.unlockService.setUi(() => ({
     prompt: async (request: any) => {
       seen.push(request);
-      return seen.length === 1
-        ? { providerId: "totp", code, totpSeed: otherSeed }
-        : null;
+      return seen.length === 1 ? { providerId: "totp", code, totpSeed: otherSeed } : null;
     },
   }));
 
   await plugin.unlockService.dekFor("note-b.md");
   const msg = seen[1].error as string;
-  assert.match(msg, /动态密码是对的/, "does not blame the code, which was valid");
-  assert.match(msg, /重新绑定|主密码/, "explains the repair");
-  assert.ok(seed !== otherSeed);
+  assert.match(msg, /凭据不正确/, "same generic rejection as a wrong code");
+  assert.ok(!/是对的/.test(msg), "does not confirm the code was valid");
   setLanguage("en");
   plugin.onunload();
 });
@@ -2589,5 +2593,339 @@ test("switchUnlockMode reuses the existing seed and writes the new mode", async 
   assert.ok(krAfter.slots["password-totp"], "combined slot present");
   assert.ok(!krAfter.slots[SLOT_PASSWORD], "no standalone password door in strict two-factor");
 
+  plugin.onunload();
+});
+
+/* ------------------------------------------------------------------ */
+/* Native locked-note editing (no custom view)                         */
+/* ------------------------------------------------------------------ */
+
+test("lockDocument seals an ordinary note in place, keeping its filename", async () => {
+  const { plugin, harness } = await boot();
+  const { createKeyring } = await import("../src/core/keyring");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+  const { noteBodyState } = await import("../src/core/format");
+
+  const password = "pw-lock-doc-1234";
+  const vaultId = "de010000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyring(vaultId, password, generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  plugin.vaultIdentifier = vaultId;
+  await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/setup", "setup");
+  await plugin.keyringStore.save(keyring);
+
+  const path = "Daily/2026-11-26.md";
+  harness.files.set(path, "# 今天\n\n一段正文\n");
+  plugin.unlockService.dekFor = async () => dek;
+  plugin.unlockService.requireKeyring = async () => keyring;
+
+  await plugin.lockDocument({ path, extension: "md", basename: "2026-11-26" } as any);
+
+  assert.ok(harness.files.has(path), "original filename kept");
+  assert.ok(!harness.files.has(`${path}.sealed.md`), "no renamed copy created");
+  assert.equal(noteBodyState(harness.files.get(path)!), "sealed", "body is the ciphertext envelope");
+  assert.equal(plugin.notes.isSealedPath(path), true, "registry recognises the in-place note");
+
+  plugin.onunload();
+});
+
+test("refreshVaultPaths detects locked notes with arbitrary filenames", async () => {
+  const { plugin, harness } = await boot();
+  const { createKeyring } = await import("../src/core/keyring");
+  const { sealNote } = await import("../src/core/format");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+
+  const vaultId = "ef010000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyring(vaultId, "pw-scan-1234567", generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  void keyring;
+  const envelope = await sealNote(dek, vaultId, vaultId, "secret body");
+  harness.files.set("Projects/plain-name.md", envelope);
+  harness.files.set("Projects/normal.md", "# not encrypted\n");
+
+  await plugin.notes.refreshVaultPaths();
+
+  assert.equal(plugin.notes.isSealedPath("Projects/plain-name.md"), true, "envelope content detected");
+  assert.equal(plugin.notes.isSealedPath("Projects/normal.md"), false, "ordinary note stays ordinary");
+  plugin.onunload();
+});
+
+test("opening a locked note never registers a custom view and the marker is present", async () => {
+  const { plugin, harness } = await boot();
+  assert.equal((plugin.app as any).vault ? true : false, true, "vault wired");
+  assert.equal(harness.registered.views.has("sealed-note-view"), false, "no padlock view");
+  assert.equal(harness.registered.extensions.has("sealed"), false, "no extension routing");
+  plugin.onunload();
+});
+
+test("a locked note stays recognised after a crash left its body as plaintext", async () => {
+  const { plugin, harness } = await boot();
+  const { createKeyring } = await import("../src/core/keyring");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+
+  const vaultId = "fe010000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyring(vaultId, "pw-index-123456", generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  plugin.vaultIdentifier = vaultId;
+  await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Start/base", "base");
+
+  const path = "Random/meeting-notes.md";
+  harness.files.set(path, "plain text");
+  plugin.notes.markSealed(path);
+  // Simulate a crash: the body is plaintext but the persisted index remembers.
+  harness.files.set(path, "# revealed after crash\n");
+  const indexPath = ".obsidian/plugins/sealed-note/vault-notes.json";
+  for (let i = 0; i < 50 && !(harness.files.get(indexPath) ?? "").includes(path); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const index = harness.files.get(indexPath) ?? "[]";
+  assert.ok(JSON.parse(index).includes(path), "the path is persisted to the local index");
+
+  // A fresh store in the same vault picks the path up without any envelope.
+  const { SealedNoteStore } = await import("../src/storage/sealed-note-store");
+  const reloaded = new SealedNoteStore(harness.app, ".obsidian/plugins/sealed-note");
+  await reloaded.refreshVaultPaths();
+  assert.equal(
+    reloaded.isSealedPath(path),
+    true,
+    "registry survives restart even without an envelope in the body",
+  );
+  plugin.onunload();
+});
+
+test("a freshly created note keeps its keyring discoverable while unlocked", async () => {
+  const { plugin, harness } = await boot();
+  const { createKeyring } = await import("../src/core/keyring");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+
+  const vaultId = "aa010000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyring(vaultId, "pw-fresh-123456", generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  plugin.vaultIdentifier = vaultId;
+
+  // First run: setup registers the keyring in memory, the wizard creates the
+  // first note and reveals it (empty plaintext body), exactly like the real
+  // newSealedNote path does.
+  // Drive the same calls the wizard makes: runSetup() registers the keyring,
+  // newSealedNote() reveals the freshly created note.
+  assert.equal(typeof plugin.setupFromSettings, "function", "settings setup wrapper exists");
+  plugin.unlockService.rememberKeyring(keyring);
+  (plugin as any).pendingKeyring = keyring;
+  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/first", "first");
+  await plugin.revealBlank(file);
+  (plugin as any).pendingKeyring = null;
+
+  assert.equal(harness.files.get(file.path), "", "body is revealed plaintext");
+  assert.equal(await plugin.hasKeyring(), true, "vault is initialized even with no sealed note on disk");
+  const loaded = await plugin.unlockService.requireKeyring();
+  assert.equal(loaded.vaultId, vaultId, "keyring still loadable for settings");
+  assert.ok(loaded.slots.recovery, "recovery slot survives for the settings page");
+  plugin.onunload();
+});
+
+test("a first-run note survives restart as a vault note (registry persisted at create)", async () => {
+  const { plugin, harness } = await boot();
+  const { createKeyring } = await import("../src/core/keyring");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+
+  const vaultId = "b1010000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyring(vaultId, "pw-restart-12345", generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  plugin.vaultIdentifier = vaultId;
+
+  // Exactly what the first-run wizard does: create the note, then reveal it.
+  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "life/test密文", "test密文");
+  await plugin.revealBlank(file);
+
+  // Restart: a fresh store over the same filesystem, scanning from disk only.
+  const { SealedNoteStore } = await import("../src/storage/sealed-note-store");
+  const restarted = new SealedNoteStore(harness.app, ".obsidian/plugins/sealed-note");
+  await restarted.refreshVaultPaths();
+
+  assert.equal(
+    restarted.isSealedPath(file.path),
+    true,
+    "the note is still a vault note after restart even though its body is plaintext",
+  );
+  plugin.onunload();
+});
+
+test("opening a leaked plaintext vault note re-seals it before it can be read", async () => {
+  const { plugin, harness } = await boot();
+  const { createKeyring } = await import("../src/core/keyring");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+  const { noteBodyState } = await import("../src/core/format");
+
+  const vaultId = "b2020000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyring(vaultId, "pw-leak-1234567", generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  plugin.vaultIdentifier = vaultId;
+  await plugin.keyringStore.save(keyring).catch(() => undefined);
+  // The registry knows the note (as after a crash), but its body is plaintext.
+  const path = "life/leaked.md";
+  plugin.notes.markSealed(path);
+  harness.files.set(path, "secret body that leaked");
+  plugin.unlockService.requireKeyring = async () => keyring;
+  plugin.unlockService.rememberKeyring(keyring); // what the real wizard does
+  let prompted = 0;
+  plugin.unlockService.dekFor = async () => {
+    prompted++;
+    return dek;
+  };
+
+  const fileOpen = harness.registered.events.find((e) => e.name === "file-open");
+  assert.ok(fileOpen, "file-open hook registered");
+  fileOpen!.fn({ path, basename: "leaked", extension: "md" });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(prompted, 1, "the credential was demanded before the body was usable");
+  assert.equal(noteBodyState(harness.files.get(path)!), "sealed", "the leaked plaintext is gone from disk");
+  plugin.onunload();
+});
+
+test("demoting a suffixed private note yields a normal note that stays normal", async () => {
+  const { plugin, harness } = await boot();
+  const { createKeyring } = await import("../src/core/keyring");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+  const { noteBodyState } = await import("../src/core/format");
+
+  const vaultId = "b3030000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyring(vaultId, "pw-demote-123456", generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  plugin.vaultIdentifier = vaultId;
+  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "Private/demote", "demote");
+  await plugin.notes.writePlaintext(file, dek, vaultId, vaultId, "the content", keyring);
+  plugin.unlockService.requireKeyring = async () => keyring;
+  plugin.unlockService.dekFor = async () => dek;
+
+  await plugin.demoteToPlain({ path: file.path, basename: "demote", extension: "md" } as any);
+
+  const plain = "Private/demote.md";
+  assert.equal(harness.files.get(plain), "the content", "plaintext restored under a normal name");
+  assert.equal(harness.files.has(file.path), false, "the .sealed.md file is gone");
+  assert.equal(plugin.notes.isSealedPath(plain), false, "no longer a vault note");
+  assert.ok(!plugin.notes.vaultNotePaths().includes(file.path), "old path out of the registry");
+  assert.ok(!plugin.notes.vaultNotePaths().includes(plain), "new path out of the registry");
+
+  // A restart must not resurrect it: the registry and content both say normal.
+  const { SealedNoteStore } = await import("../src/storage/sealed-note-store");
+  const restarted = new SealedNoteStore(harness.app, ".obsidian/plugins/sealed-note");
+  await restarted.refreshVaultPaths();
+  assert.equal(restarted.isSealedPath(plain), false, "demotion survives restart");
+  plugin.onunload();
+});
+
+test("unlock pushes plaintext into a stale editor buffer (the no-plaintext-injection bug)", async () => {
+  const { plugin, harness } = await boot();
+  const { createKeyring } = await import("../src/core/keyring");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+
+  const vaultId = "c4040000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyring(vaultId, "pw-buffer-12345", generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  plugin.vaultIdentifier = vaultId;
+  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "life/buffer", "buffer");
+
+  // The note is open in the editor with its body still the envelope. The
+  // buffer is a snapshot taken at open time and is NOT auto-synced here -
+  // exactly the state that produced "unlock showed no plaintext".
+  const envelopeBody = harness.files.get(file.path)!;
+  const buffer: { value: string } = { value: envelopeBody };
+  harness.app.workspace.mdView = {
+    file: { path: file.path, basename: "buffer", extension: "md" },
+    editor: {
+      getValue: () => buffer.value,
+      setValue: (v: string) => {
+        buffer.value = v;
+      },
+    },
+  };
+  plugin.unlockService.dekFor = async () => dek;
+  plugin.unlockService.requireKeyring = async () => keyring;
+
+  await plugin.unlockNote({ path: file.path, basename: "buffer", extension: "md" } as any);
+  await new Promise((resolve) => setTimeout(resolve, 30)); // buffer sync is async
+
+  assert.equal(buffer.value, "", "the stale envelope buffer was replaced with the revealed plaintext");
+  assert.notEqual(buffer.value, envelopeBody, "the envelope is gone from the buffer");
+
+  // And locking swaps the buffer back to ciphertext, not a stale plaintext.
+  plugin.sessions.put(file.path, dek, "test", keyring);
+  await plugin.lockNote(file.path);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.ok(buffer.value.startsWith("<!-- sealed-note/note/1"), "the buffer now holds the envelope again");
+  plugin.onunload();
+});
+
+test("a renamed envelope note (no suffix, not in registry) still unlocks - content self-heals identity", async () => {
+  const { plugin, harness } = await boot();
+  const { createKeyring } = await import("../src/core/keyring");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+
+  const vaultId = "d5050000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyring(vaultId, "pw-rename-123456", generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  plugin.vaultIdentifier = vaultId;
+  const file = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "life/orig", "orig");
+
+  // The user renames through Obsidian's API with NO plugin event wired (as if
+  // the rename came from outside): suffix gone, registry entry gone.
+  const body = harness.files.get(file.path)!;
+  harness.files.delete(file.path);
+  const renamed = "life/apikey.md";
+  harness.files.set(renamed, body);
+  (plugin.notes as any).vaultPaths.delete(file.path);
+  assert.equal(plugin.notes.isSealedPath(renamed), false, "precondition: identity lost");
+
+  let prompted = 0;
+  plugin.unlockService.dekFor = async () => {
+    prompted++;
+    return dek;
+  };
+  plugin.unlockService.requireKeyring = async () => keyring;
+
+  // The banner's unlock button calls this. Before the fix it silently returns.
+  await plugin.unlockNote({ path: renamed, basename: "apikey", extension: "md" } as any);
+
+  assert.equal(prompted, 1, "unlock asked for the credential instead of silently returning");
+  assert.equal(plugin.notes.isSealedPath(renamed), true, "the note re-registered itself from its content");
+  assert.equal(harness.files.get(renamed), "", "body revealed to plaintext");
+  plugin.onunload();
+});
+
+test("modify on a plain-looking path that holds an envelope re-registers it", async () => {
+  const { plugin, harness } = await boot();
+  const { createKeyring } = await import("../src/core/keyring");
+  const { generateRecoveryKey } = await import("../src/core/recovery");
+
+  const vaultId = "d6060000-2222-4333-8444-555555555555";
+  const { keyring, dek } = await createKeyring(vaultId, "pw-sync-1234567", generateRecoveryKey(), {
+    iterations: 100_000,
+  });
+  plugin.vaultIdentifier = vaultId;
+  const src = await plugin.notes.create({ vaultId, kid: vaultId, keyring }, dek, "life/src", "src");
+  const envelope = harness.files.get(src.path)!;
+
+  // Simulate a sync client delivering the note under a plain name: modify
+  // event fires, path unknown to the registry.
+  const path = "life/synced.md";
+  harness.files.set(path, envelope);
+  const modify = harness.registered.events.find((e) => e.name === "vault:modify");
+  assert.ok(modify, "vault modify handler registered");
+  // The handler guards on instanceof TFile, so deliver a real one.
+  const synced = harness.app.vault.getAbstractFileByPath(path) ?? { path, basename: "synced", extension: "md" };
+  modify!.fn(synced);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(plugin.notes.isSealedPath(path), true, "the envelope body re-registered the note");
   plugin.onunload();
 });

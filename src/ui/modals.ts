@@ -126,7 +126,7 @@ export class UnlockModal extends Modal {
       const tick = () => {
         if (!this.totpHintEl) return;
         this.totpHintEl.setText(
-          `验证码每 30 秒刷新，当前剩余 ${totpRemainingSeconds()} 秒`,
+          t("prompt.codeRemaining", { n: 30, left: totpRemainingSeconds() }),
         );
       };
       tick();
@@ -153,7 +153,7 @@ export class UnlockModal extends Modal {
   private submit(): void {
     const missing = this.provider.fields.find((f) => !this.values[f.key]?.trim());
     if (missing) {
-      this.errorEl?.setText(`请填写${missing.label}`);
+      this.errorEl?.setText(t("prompt.fillField", { field: missing.label }));
       return;
     }
     this.resolved = true;
@@ -406,8 +406,8 @@ export class RecoveryKeyModal extends Modal {
     download.addEventListener("click", () => {
       const body = [
         t("recovery.fileTitle"),
-        `保管库：${this.vaultName}`,
-        `指纹：${this.fingerprint}`,
+        t("recovery.fileVault", { vault: this.vaultName }),
+        t("recovery.fileFingerprint", { fp: this.fingerprint }),
         "",
         formatted,
         "",
@@ -488,7 +488,7 @@ export class ConfirmModal extends Modal {
 
     if (this.opts.typeToConfirm) {
       ok.disabled = true;
-      const field = new Setting(contentEl).setName(`输入 ${this.opts.typeToConfirm} 以确认`);
+      const field = new Setting(contentEl).setName(t("modal.typeToConfirm", { value: this.opts.typeToConfirm }));
       field.addText((text) => {
         text.inputEl.addEventListener("input", () => {
           ok.disabled = text.getValue() !== this.opts.typeToConfirm;

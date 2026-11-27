@@ -72,7 +72,7 @@ async function renderEncryptedBlock(
     card.empty();
     const label = card.createEl("button", { cls: "sealed-block-lock" });
     setIcon(label, "lock");
-    label.createSpan({ text: ` 已加密 · ${payload.length} 字符` });
+    label.createSpan({ text: ` ${t("block.encrypted", { n: payload.length })}` });
     label.addEventListener("click", () => void decrypt());
   };
 
@@ -90,12 +90,12 @@ async function renderEncryptedBlock(
       body.setText(plain);
 
       const bar = card.createDiv({ cls: "sealed-block-bar" });
-      const copy = bar.createEl("button", { text: "复制", cls: "sealed-btn" });
+      const copy = bar.createEl("button", { text: t("block.copy"), cls: "sealed-btn" });
       copy.addEventListener("click", async () => {
         await navigator.clipboard.writeText(plain);
-        new Notice("已复制到剪贴板");
+        new Notice(t("block.copied"));
       });
-      const hide = bar.createEl("button", { text: "隐藏", cls: "sealed-btn" });
+      const hide = bar.createEl("button", { text: t("block.hide"), cls: "sealed-btn" });
       hide.addEventListener("click", () => {
         card.removeClass("is-revealed");
         render();

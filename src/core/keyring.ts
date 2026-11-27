@@ -15,6 +15,7 @@
  * rewritten: resetting a credential is instant and atomic.
  */
 
+import { t } from "../i18n";
 import {
   DEFAULT_KDF,
   DecryptError,
@@ -78,16 +79,16 @@ export function credentialFor(
 ): string {
   switch (slot) {
     case SLOT_PASSWORD:
-      if (!parts.password) throw new UnlockError("缺少主密码");
+      if (!parts.password) throw new UnlockError(t("error.missingPassword"));
       return `sn-pwd|${parts.password}`;
     case SLOT_TOTP:
-      if (!parts.totpSeed) throw new UnlockError("缺少动态密码种子");
+      if (!parts.totpSeed) throw new UnlockError(t("error.missingSeed"));
       return `sn-totp|${parts.totpSeed}`;
     case SLOT_PASSWORD_TOTP:
-      if (!parts.password || !parts.totpSeed) throw new UnlockError("缺少主密码或动态密码种子");
+      if (!parts.password || !parts.totpSeed) throw new UnlockError(t("error.missingBoth"));
       return `sn-pwd-totp|${parts.password}|${parts.totpSeed}`;
     case SLOT_RECOVERY:
-      if (!parts.recovery) throw new UnlockError("缺少恢复密钥");
+      if (!parts.recovery) throw new UnlockError(t("error.missingRecovery"));
       return `sn-rec|${normalizeRecovery(parts.recovery)}`;
   }
 }
@@ -524,7 +525,9 @@ export function registerSuccess(guard: GuardState): void {
 
 export function describeGuardWait(ms: number): string {
   if (ms <= 0) return "";
-  return ms >= 1000 ? `请在 ${Math.ceil(ms / 1000)} 秒后重试` : "请稍后重试";
+  return ms >= 1000
+    ? t("guard.retryIn", { n: Math.ceil(ms / 1000) })
+    : t("guard.retrySoon");
 }
 
 /* ------------------------------------------------------------------ */

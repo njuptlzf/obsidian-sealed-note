@@ -12,10 +12,12 @@
  * stays in sync with disk.
  */
 
+import { t } from "../i18n";
 import { App, TFile, normalizePath } from "obsidian";
 import {
   KeyCopy,
   NoteEnvelope,
+  looksLikeNoteEnvelope,
   noteBodyState,
   openNote,
   parseNoteEnvelope,
@@ -43,6 +45,14 @@ export class SealedNoteStore {
   private readonly log = log.child("sealed-note-store");
   /** per-path write chain: two saves of one file must never interleave */
   private readonly writeChains = new Map<string, Promise<void>>();
+  /**
+   * Ordinary notes locked in place keep their filename, so the `.sealed.md`
+   * suffix alone cannot identify them. This set is the content-detected
+   * registry: populated at startup by scanning note bodies, and updated on
+   * lock/reveal/create/delete. Callers get a synchronous isSealedPath while
+   * the source of truth remains the envelope in each note.
+   */
+  private readonly vaultPaths = new Set<string>();
 
   constructor(
     private readonly app: App,
@@ -52,7 +62,122 @@ export class SealedNoteStore {
   /* ---------------- paths ------------------------------------------------- */
 
   isSealedPath(path: string): boolean {
-    return path.toLowerCase().endsWith(`.${SEALED_EXTENSION}`);
+    return this.vaultPaths.has(path) || path.toLowerCase().endsWith(`.${SEALED_EXTENSION}`);
+  }
+
+  /** Path of the persisted registry, inside the plugin's own (hidden) dir. */
+  private get vaultIndexPath(): string {
+    return normalizePath(`${this.pluginDir}/vault-notes.json`);
+  }
+
+  /**
+   * Rebuild the registry at startup from two sources: the persisted list (which
+   * keeps a note recognised even after a crash left its body as plaintext) and
+   * a content scan (which catches notes added by sync while Obsidian was off).
+   * Entries whose file no longer exists are pruned.
+   */
+  async refreshVaultPaths(): Promise<void> {
+    this.vaultPaths.clear();
+    try {
+      const index = await this.app.vault.adapter.read(this.vaultIndexPath);
+      const paths = JSON.parse(index);
+      if (Array.isArray(paths)) {
+        for (const p of paths) {
+          if (typeof p === "string" && this.app.vault.getAbstractFileByPath(p)) {
+            this.vaultPaths.add(p);
+          }
+        }
+      }
+    } catch {
+      // No index yet (first run) or corrupt: the content scan below rebuilds it.
+    }
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (file.path.toLowerCase().endsWith(`.${SEALED_EXTENSION}`)) {
+        this.vaultPaths.add(file.path);
+        continue;
+      }
+      try {
+        const raw = await this.app.vault.cachedRead(file);
+        if (looksLikeNoteEnvelope(raw)) this.vaultPaths.add(file.path);
+      } catch {
+        // unreadable file: leave it out, it cannot be opened either
+      }
+    }
+    await this.persistVaultPaths();
+    this.log.info("vault_paths_scanned", { count: this.vaultPaths.size });
+  }
+
+  /** Persist the registry so arbitrary-named notes survive a crash while revealed. */
+  private persistVaultPaths(): Promise<void> {
+    // Serialize through the same per-path chain used for note bodies: a boot
+    // scan and a later markSealed() must not land their index writes out of
+    // order (a stale empty index would lose the newly registered path).
+    return this.chainWrite(this.vaultIndexPath, async () => {
+      try {
+        const dir = this.pluginDir;
+        if (dir && !(await this.app.vault.adapter.exists(dir))) {
+          await this.app.vault.adapter.mkdir(dir);
+        }
+        await this.app.vault.adapter.write(
+          this.vaultIndexPath,
+          JSON.stringify([...this.vaultPaths].sort(), null, 2),
+        );
+      } catch (error) {
+        this.log.warn("vault_index_write_failed", { error: String(error) });
+      }
+    });
+  }
+
+  /** Register a path after sealing a note in place. Awaited by create(). */
+  markSealed(path: string): Promise<void> {
+    this.vaultPaths.add(path);
+    return this.persistVaultPaths();
+  }
+
+  /**
+   * Content is the source of truth for what a private note IS; the suffix and
+   * the registry are only how we recognise it cheaply. A note can lose both
+   * while keeping its envelope: renamed outside the plugin (sync client,
+   * another device, a lost rename event), or registered before a crash wiped
+   * the index. When that happens, the body itself still says "sealed" - so
+   * re-register from the content instead of treating the note as ordinary.
+   * Returns true when the note was healed (or already known).
+   */
+  async healIdentity(file: TFile): Promise<boolean> {
+    if (this.isSealedPath(file.path)) return true;
+    // Only a parseable envelope counts. A plaintext body is NOT registered:
+    // it may be an ordinary note, and a leaked revealed note is handled by
+    // the plugin's re-seal safety net, not by silently changing its identity.
+    // cachedRead: this runs on open/modify for EVERY note, so it must not
+    // force a disk read.
+    const raw = await this.app.vault.cachedRead(file).catch(() => "");
+    if (noteBodyState(raw) !== "sealed") return false;
+    if (!parseNoteEnvelope(raw)) return false;
+    await this.markSealed(file.path);
+    this.log.info("identity_healed_from_content", { path: file.path });
+    return true;
+  }
+
+  /** Every known vault note path, for the file-explorer badges. */
+  vaultNotePaths(): string[] {
+    return [...this.vaultPaths];
+  }
+
+  /** Drop a path when a note is deleted or permanently unlocked. */
+  unmarkSealed(path: string): Promise<void> {
+    this.vaultPaths.delete(path);
+    return this.persistVaultPaths();
+  }
+
+  /**
+   * Carry registry membership across a user rename. Only when the old path
+   * was registered: a plain note renamed to bar.md must not become a vault
+   * note, and a demoted note must stay demoted.
+   */
+  renameVaultPath(oldPath: string, newPath: string): Promise<void> {
+    const was = this.vaultPaths.delete(oldPath);
+    if (was) this.vaultPaths.add(newPath);
+    return this.persistVaultPaths();
   }
 
   /** Every locked note carries a key copy in its own body. */
@@ -76,16 +201,22 @@ export class SealedNoteStore {
   ): Promise<TFile> {
     const normalized = normalizePath(this.withExtension(path));
     const existing = this.app.vault.getAbstractFileByPath(normalized);
-    if (existing) throw Err.io(`同名文件已存在：${normalized}`);
+    if (existing) throw Err.io(t("error.fileExists", { path: normalized }));
 
     const copy = kr.keyring ? keyCopyFromKeyringData(kr.keyring) : undefined;
     // The revealed note will open as a clean blank editor, exactly like
     // Obsidian's own "New note". Locked body already carries the ciphertext.
     const sealed = parseNoteEnvelope(await sealNote(dek, kr.vaultId, kr.kid, "", copy));
-    if (!sealed) throw Err.io("无法生成加密笔记信封");
+    if (!sealed) throw Err.io(t("error.envelopeFail"));
 
     await this.ensureFolder(normalized);
     const file = await this.app.vault.create(normalized, serializeNoteEnvelope(sealed));
+    // Persist, not just remember: the body is revealed immediately after
+    // creation, so the envelope (and with it the suffix-free identity of this
+    // note) exists on disk only for a moment. If the registry were only
+    // rebuilt from bodies at next boot, a renamed or crash-revealed note would
+    // silently stop being a vault note.
+    await this.markSealed(normalized);
     this.log.info("sealed_note_created", { path: normalized });
     return file;
   }
@@ -137,7 +268,7 @@ export class SealedNoteStore {
   ): Promise<void> {
     const copy = keyring ? keyCopyFromKeyringData(keyring) : undefined;
     const sealed = parseNoteEnvelope(await sealNote(dek, vaultId, kid, plaintext, copy));
-    if (!sealed) throw Err.io("无法生成加密笔记信封");
+    if (!sealed) throw Err.io(t("error.envelopeFail"));
     const body = serializeNoteEnvelope(sealed);
 
     await this.chainWrite(file.path, async () => {
@@ -273,8 +404,8 @@ export class SealedNoteStore {
   /* ---------------- detection --------------------------------------------- */
 
   async isSealedFile(file: TFile): Promise<boolean> {
-    if (this.isSealedPath(file.path)) return true;
     if (file.extension !== "md") return false;
+    if (this.isSealedPath(file.path)) return true;
     try {
       return noteBodyState(await this.app.vault.read(file)) === "sealed";
     } catch {
