@@ -17,7 +17,6 @@ import {
   TFolder,
   WorkspaceLeaf,
   normalizePath,
-  setIcon,
 } from "obsidian";
 
 import { DEFAULT_SETTINGS, SealedNoteSettings, normalizeSettings } from "./settings";
@@ -25,7 +24,7 @@ import type { LockPolicy } from "./settings";
 import { setLanguage, t } from "./i18n";
 import { SealedNoteSettingTab } from "./ui/settings";
 import { NoteKeyringStore } from "./storage/note-keyring-store";
-import { SealedNoteStore, SEALED_EXTENSION } from "./storage/sealed-note-store";
+import { SealedNoteStore } from "./storage/sealed-note-store";
 import { SessionStore } from "./core/session";
 import { UnlockService } from "./services/unlock-service";
 import { EncryptionService } from "./services/encryption-service";
@@ -36,23 +35,36 @@ import { registerInlinePayloads } from "./inline/postprocessor";
 import { registerLockedMarker } from "./notes/locked-marker";
 import { applyExplorerBadges } from "./notes/explorer-badges";
 import { ciphertextGuard, openCiphertextSyncWindow, setCiphertextGuardUnlockHandler } from "./editor/ciphertext-guard";
-import { generateRecoveryKey, groupRecovery } from "./core/recovery";
+import { generateRecoveryKey } from "./core/recovery";
 import { createKeyring, createKeyringWithoutPassword, formatKeyringFromCopy, keyFingerprint, newVaultId, SLOT_PASSWORD, SLOT_TOTP, SLOT_PASSWORD_TOTP, SLOT_RECOVERY, KeyringData, setSlot } from "./core/keyring";
-import { generateTotpSecret, totpUri, formatSecret } from "./core/totp";
 import { describeError, Err } from "./util/errors";
 import { log, setLogLevel } from "./util/log";
-import { findUnsealedBlocks, openInline } from "./core/format";
+import { findUnsealedBlocks } from "./core/format";
 import { TotpSetupModal } from "./ui/totp-modal";
 import { CandidatePickerModal, SecretPromptModal } from "./ui/recovery-modals";
 import { UnlockModeModal, PasswordPromptModal } from "./ui/mode-modals";
 import { sealWithDevice } from "./core/device";
 import { SeedImportModal } from "./ui/seed-import-modal";
 import { VaultRecoveryService } from "./services/vault-recovery";
+import type { RecoveryCandidate } from "./services/vault-recovery";
 import { KeyCopyRefreshService } from "./services/key-copy-refresh";
 import { NameModal } from "./ui/name-modal";
 import { BusyOverlay } from "./ui/busy";
+import type {
+  SettingApp, ViewWithFile, EditorLike, MarkdownViewLike, SplitNode, WorkspaceInternals, CodedError,
+} from "./util/internal-types";
 
 const SEALED_ICON = "lock";
+
+// Ambient binding (emits no JS): Obsidian defines it; the Node test harness
+// only installs the plain `document` global.
+declare const activeDocument: Document | undefined;
+declare const document: Document;
+
+/** Document of the focused window, falling back to the headless test global. */
+function hostDocument(): Document {
+  return typeof activeDocument !== "undefined" ? activeDocument : document;
+}
 
 export default class SealedNotePlugin extends Plugin {
   private readonly log = log.child("plugin");
@@ -313,6 +325,19 @@ export default class SealedNotePlugin extends Plugin {
     return this.settingsData;
   }
 
+  /** `app.setting` is internal; a missing or changed shape degrades to a no-op. */
+  private get settingApp(): SettingApp | null {
+    return (this.app as unknown as { setting?: SettingApp }).setting ?? null;
+  }
+
+  /** Open the settings pane on this plugin's tab (internal API, best effort). */
+  private openSettingsTab(): void {
+    const setting = this.settingApp;
+    if (!setting) return;
+    setting.open();
+    setting.openTabById?.(this.manifest.id);
+  }
+
   /** The token Obsidian uses to route ".sealed.md" files to our view. */
   extensionToken(): string {
     return this.settingsData.extension.split(".")[0];
@@ -571,8 +596,7 @@ export default class SealedNotePlugin extends Plugin {
       id: "open-settings",
       name: t("cmd.settings.name"),
       callback: () => {
-        (this.app as any).setting?.open?.();
-        (this.app as any).setting?.openTabById?.(this.manifest.id);
+        this.openSettingsTab();
       },
     });
   }
@@ -680,7 +704,7 @@ export default class SealedNotePlugin extends Plugin {
     );
 
     // Reading view context menu for rendered blocks.
-    this.registerDomEvent(document, "contextmenu", (event) => {
+    this.registerDomEvent(hostDocument(), "contextmenu", (event) => {
       const target = event.target as HTMLElement;
       if (!target.closest(".sealed-block, .sealed-pill")) return;
       // handled by the global app menu; nothing to do here beyond stopping
@@ -713,8 +737,7 @@ export default class SealedNotePlugin extends Plugin {
           .setTitle(t("settings.configure"))
           .setIcon("settings")
           .onClick(() => {
-            (this.app as any).setting?.open?.();
-            (this.app as any).setting?.openTabById?.(this.manifest.id);
+            this.openSettingsTab();
           }),
       );
       menu.showAtMouseEvent(event);
@@ -771,8 +794,8 @@ export default class SealedNotePlugin extends Plugin {
       const leaves = this.app.workspace.getLeavesOfType?.("file-explorer") ?? [];
       const sealed = new Set(this.notes.vaultNotePaths());
       for (const leaf of leaves) {
-        const root = (leaf.view as any)?.contentEl as HTMLElement | undefined;
-        if (!root || typeof root.querySelectorAll !== "function") continue;
+        const root = (leaf.view as unknown as { contentEl?: HTMLElement }).contentEl;
+        if (!root || typeof root.find !== "function") continue;
         applyExplorerBadges(root, sealed);
         this.observeExplorer(root);
       }
@@ -931,7 +954,7 @@ export default class SealedNotePlugin extends Plugin {
    */
   private hookSettingsOpen(): void {
     try {
-      const setting = (this.app as any).setting;
+      const setting = this.settingApp;
       if (!setting || typeof setting.open !== "function" || setting.__sealedNotePatched) return;
       const open = setting.open.bind(setting);
       setting.open = (...args: unknown[]) => {
@@ -967,7 +990,7 @@ export default class SealedNotePlugin extends Plugin {
       ...(this.app.workspace.getLeavesOfType?.("markdown") ?? []),
     ];
     for (const leaf of leaves) {
-      if ((leaf.view as any)?.file?.path === path) {
+      if (this.viewPath(leaf) === path) {
         this.unlockedLeaves.set(path, leaf);
         return;
       }
@@ -999,7 +1022,7 @@ export default class SealedNotePlugin extends Plugin {
   private anyLeafShows(path: string): boolean {
     let found = false;
     this.app.workspace.iterateAllLeaves((leaf: WorkspaceLeaf) => {
-      if ((leaf.view as any)?.file?.path === path) found = true;
+      if (this.viewPath(leaf) === path) found = true;
     });
     return found;
   }
@@ -1027,7 +1050,7 @@ export default class SealedNotePlugin extends Plugin {
     try {
       await action();
     } catch (error) {
-      if (error instanceof Error && (error as any).name === "E_CANCELLED") return;
+      if (error instanceof Error && error.name === "E_CANCELLED") return;
       this.log.error("action_failed", { error: String(error), stack: error instanceof Error ? error.stack : undefined });
       new Notice(describeError(error), 8000);
     }
@@ -1168,10 +1191,10 @@ export default class SealedNotePlugin extends Plugin {
    * filters anything. leaf.isSideLeaf() is not an API either. The reliable
    * test is walking `parent` up to the split containers.
    */
-  private isMainAreaLeaf(leaf: any): boolean {
+  private isMainAreaLeaf(leaf: unknown): boolean {
     try {
-      const ws = this.app.workspace as any;
-      let node: any = leaf;
+      const ws = this.app.workspace as unknown as WorkspaceInternals;
+      let node: SplitNode | null | undefined = leaf as SplitNode;
       let guard = 0;
       while (node && guard++ < 64) {
         if (node === ws.leftSplit || node === ws.rightSplit) return false;
@@ -1187,8 +1210,20 @@ export default class SealedNotePlugin extends Plugin {
   }
 
   /** Inverse of isMainAreaLeaf; kept for call sites that skip side panes. */
-  private isSideLeaf(leaf: any): boolean {
+  private isSideLeaf(leaf: unknown): boolean {
     return !this.isMainAreaLeaf(leaf);
+  }
+
+  /** Path shown by a leaf's view, if it has a file (decoration-only helper). */
+  private viewPath(leaf: WorkspaceLeaf): string | undefined {
+    const view = leaf.view as unknown as ViewWithFile | null;
+    return view?.file?.path ?? undefined;
+  }
+
+  /** Reveal a leaf through the public API; no-op if the host does not support it. */
+  private async revealLeaf(leaf: WorkspaceLeaf): Promise<void> {
+    const reveal = (this.app.workspace as unknown as { revealLeaf?: (leaf: WorkspaceLeaf) => Promise<void> }).revealLeaf;
+    if (reveal) await reveal.call(this.app.workspace, leaf);
   }
 
   /* ---------------- in-place unlock / lock ------------------------------- */
@@ -1248,7 +1283,7 @@ export default class SealedNotePlugin extends Plugin {
         try {
           await this.notes.revealNote(noteFile, dek, this.vaultId());
         } catch (error) {
-          if ((error as any)?.code !== "E_BAD_ENVELOPE") throw error;
+          if ((error as CodedError).code !== "E_BAD_ENVELOPE") throw error;
           // A note damaged by an external editor: seal its bytes first, then
           // reveal them. writePlaintext now writes the envelope into THIS
           // file, so the following revealNote turns it back into editable
@@ -1437,7 +1472,7 @@ export default class SealedNotePlugin extends Plugin {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return;
     const view = this.markdownViewFor(path);
-    const editor = (view as any)?.editor;
+    const editor = (view as unknown as { editor?: EditorLike } | null)?.editor;
     if (!editor || typeof editor.getValue !== "function") return;
     void this.app.vault
       .read(file)
@@ -1457,21 +1492,21 @@ export default class SealedNotePlugin extends Plugin {
    * getLeaf(false)/activeLeaf can be the file explorer, hence the leaf check.
    */
   private async showAsMarkdown(path: string): Promise<void> {
-    const ws = this.app.workspace as any;
-    const mdLeaves = ws.getLeavesOfType?.("markdown") ?? [];
+    const mdLeaves = this.app.workspace.getLeavesOfType("markdown") ?? [];
     for (const leaf of mdLeaves) {
-      if ((leaf.view as any)?.file?.path === path && !this.isSideLeaf(leaf)) {
-        await ws.revealLeaf?.(leaf);
+      if (this.viewPath(leaf) === path && !this.isSideLeaf(leaf)) {
+        await this.revealLeaf(leaf);
         return;
       }
     }
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!file) return;
-    const active = ws.activeLeaf;
-    const leaf = active && this.isMainAreaLeaf(active) ? active : ws.getLeaf(true);
+    const internals = this.app.workspace as unknown as WorkspaceInternals;
+    const active = internals.activeLeaf;
+    const leaf = active && this.isMainAreaLeaf(active) ? active : this.app.workspace.getLeaf(true);
     if (!leaf) throw Err.io(t("error.noEditorLeaf"));
-    await leaf.setViewState({ type: "markdown", state: { file: path }, active: true } as any);
-    await ws.revealLeaf?.(leaf);
+    await leaf.setViewState({ type: "markdown", state: { file: path }, active: true });
+    await this.revealLeaf(leaf);
   }
 
   /** The Markdown view currently showing `path`, if any. */
@@ -1479,8 +1514,7 @@ export default class SealedNotePlugin extends Plugin {
     const active = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (active?.file?.path === path) return active;
     for (const leaf of this.app.workspace.getLeavesOfType("markdown") ?? []) {
-      const view = leaf.view as MarkdownView;
-      if ((view as any)?.file?.path === path) return view;
+      if (this.viewPath(leaf) === path) return leaf.view as MarkdownView;
     }
     return null;
   }
@@ -1654,7 +1688,7 @@ export default class SealedNotePlugin extends Plugin {
       ...(this.app.workspace.getLeavesOfType?.("markdown") ?? []),
     ];
     for (const leaf of leaves) {
-      if ((leaf.view as any)?.file?.path === path) {
+      if (this.viewPath(leaf) === path) {
         this.unsealedLeaves.set(path, leaf);
         return;
       }
@@ -1693,9 +1727,9 @@ export default class SealedNotePlugin extends Plugin {
       let inEditor = false;
       let inReading = false;
       this.app.workspace.iterateAllLeaves?.((leaf: WorkspaceLeaf) => {
-        const view = leaf.view as any;
+        const view = leaf.view as unknown as MarkdownViewLike | null;
         if (view?.getViewType?.() !== "markdown") return;
-        if (view?.file?.path !== path) return;
+        if (view.file?.path !== path) return;
         if (typeof view.getMode === "function" && view.getMode() === "reading") inReading = true;
         else inEditor = true;
       });
@@ -2008,7 +2042,7 @@ export default class SealedNotePlugin extends Plugin {
     const timer = this.saveTimers.get(file.path);
     if (timer) window.clearTimeout(timer);
     this.saveTimers.delete(file.path);
-    this.notes.unmarkSealed(file.path);
+    void this.notes.unmarkSealed(file.path);
     this.sessions.lock(file.path);
     this.releaseBusy(file.path);
     this.refreshStatusBar();
@@ -2049,7 +2083,7 @@ export default class SealedNotePlugin extends Plugin {
       return;
     }
 
-    const picked = await new Promise<any | null>((resolve) => {
+    const picked = await new Promise<RecoveryCandidate | null>((resolve) => {
       new CandidatePickerModal(this.app, candidates, (c) => resolve(c)).open();
     });
     if (!picked) return;

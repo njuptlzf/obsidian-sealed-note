@@ -11,6 +11,10 @@ export default defineConfig([
     "eslint.config.mjs",
     "debug",
     "docs",
+    // Test files are bundled by esbuild outside the tsconfig project; they are
+    // exercised by `npm test` rather than the plugin-source lint rules.
+    "tests",
+    "scripts",
   ]),
   ...obsidianmd.configs.recommended,
   {
