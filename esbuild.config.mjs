@@ -1,7 +1,11 @@
 import esbuild from "esbuild";
 import process from "process";
-import builtins from "builtin-modules";
+import { builtinModules } from "node:module";
 import { rmSync, mkdirSync } from "fs";
+
+// Node's built-in list is the maintainer-backed replacement for the deprecated
+// `builtin-modules` package; prefix both bare and node: specifiers.
+const builtins = [...builtinModules, ...builtinModules.map((name) => `node:${name}`)];
 
 const banner = `/*
 Sealed Note for Obsidian - bundled build.

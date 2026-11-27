@@ -1,10 +1,11 @@
 /** Settings tab. Also the place where keyring state is made visible. */
 
-import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, Modal, Notice, PluginSettingTab, Setting, requireApiVersion } from "obsidian";
+import type { SettingDefinitionItem } from "obsidian";
 import type SealedNotePlugin from "../main";
 import { describeGuardWait, guardRemainingMs, SLOT_PASSWORD } from "../core/keyring";
 import { describeError } from "../util/errors";
-import { t, LANGUAGE_OPTIONS, setLanguage } from "../i18n";
+import { t, LANGUAGE_OPTIONS } from "../i18n";
 import type { Language } from "../i18n";
 import type { LockPolicy } from "../settings";
 
@@ -16,12 +17,63 @@ export class SealedNoteSettingTab extends PluginSettingTab {
     super(app, plugin);
   }
 
+  /**
+   * Declarative definitions (Obsidian 1.13+) make these settings searchable.
+   * The dynamic keyring status card stays in `display()` for older versions;
+   * on 1.13+ Obsidian renders these definitions instead and skips display().
+   * Both paths must stay in sync when a setting is added or changed.
+   *
+   * `getControlValue`/`setControlValue` below route the declarative controls
+   * to the plugin's `settingsData` (it does not use the reserved `settings`
+   * member), and `setControlValue` goes through `saveSettings()` so the
+   * language and status bar stay in sync.
+   */
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    return [
+      {
+        name: t("settings.sectionNotes"),
+        control: { type: "dropdown", key: "language", options: LANGUAGE_OPTIONS },
+      },
+      {
+        name: t("settings.showBadges"),
+        desc: t("settings.showBadgesDesc"),
+        control: { type: "toggle", key: "showInlineBadges" },
+      },
+      {
+        name: t("settings.confirmDecrypt"),
+        desc: t("settings.confirmDecryptDesc"),
+        control: { type: "toggle", key: "confirmWholeNoteDecrypt" },
+      },
+      {
+        name: t("settings.lockBlur"),
+        desc: t("settings.lockBlurDesc"),
+        control: {
+          type: "dropdown",
+          key: "lockPolicy",
+          options: {
+            blur: t("settings.lockPolicy.blur"),
+            close: t("settings.lockPolicy.close"),
+            session: t("settings.lockPolicy.session"),
+          },
+        },
+      },
+    ];
+  }
+
+  getControlValue(key: string): unknown {
+    const values = this.plugin.settingsData as unknown as Record<string, unknown>;
+    return values[key];
+  }
+
+  setControlValue(key: string, value: unknown): void {
+    (this.plugin.settingsData as unknown as Record<string, unknown>)[key] = value;
+    void this.plugin.saveSettings();
+  }
+
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.addClass("sealed-settings");
-
-    containerEl.createEl("h2", { text: "Sealed Note" });
 
     void this.renderStatus(containerEl);
     this.renderSecurityNotice(containerEl);
@@ -34,18 +86,20 @@ export class SealedNoteSettingTab extends PluginSettingTab {
 
   private async renderStatus(parent: HTMLElement): Promise<void> {
     const card = parent.createDiv({ cls: "sealed-card" });
-    card.createEl("h3", { text: t("settings.status") });
+    new Setting(card).setName(t("settings.status")).setHeading();
 
     const exists = await this.plugin.hasKeyring();
     if (!exists) {
       card.createEl("p", { text: t("settings.noKey"), cls: "sealed-hint" });
       const btn = card.createEl("button", { text: t("settings.setupNow"), cls: "mod-cta" });
-      btn.addEventListener("click", async () => {
+      btn.addEventListener("click", () => {
         // Use the real wizard: it registers the keyring in memory and lets the
         // first note carry the key copy. The old inline path minted a keyring
         // with no note to hold it, so it vanished on restart.
-        await this.plugin.setupFromSettings();
-        this.display();
+        void (async () => {
+          await this.plugin.setupFromSettings();
+          this.display();
+        })();
       });
       return;
     }
@@ -126,8 +180,13 @@ export class SealedNoteSettingTab extends PluginSettingTab {
       new Setting(card)
         .setName(t("settings.harden.title"))
         .setDesc(t("settings.harden.desc"))
-        .addButton((btn) =>
-          btn.setButtonText(t("settings.harden.button")).setWarning().onClick(async () => {
+        .addButton((btn) => {
+          btn.setButtonText(t("settings.harden.button"));
+          // setDestructive() arrived in 1.13.0; keep the older CTA style on
+          // earlier builds so the button always reads as prominent.
+          if (requireApiVersion("1.13.0")) btn.setDestructive().setCta();
+          else btn.setCta();
+          btn.onClick(async () => {
             const dek = await this.plugin.unlockService.dekFor("__settings__", { subject: t("settings.harden.title") });
             if (!dek) return;
             try {
@@ -138,8 +197,9 @@ export class SealedNoteSettingTab extends PluginSettingTab {
               new Notice(describeError(error), 10000);
             }
             this.display();
-          }),
-        );
+          });
+          return btn;
+        });
     }
 
     if (kr.totp.enabled) {
@@ -153,7 +213,7 @@ export class SealedNoteSettingTab extends PluginSettingTab {
           }),
         );
 
-      const note = card.createEl("div", { cls: "sealed-hint" });
+      const note = card.createDiv({ cls: "sealed-hint" });
       note.appendText(
         t("settings.totpHintA") +
         t("settings.totpHintB") +
@@ -195,7 +255,7 @@ export class SealedNoteSettingTab extends PluginSettingTab {
   /* ---------------- general ---------------- */
 
   private renderGeneral(parent: HTMLElement): void {
-    parent.createEl("h3", { text: t("settings.sectionNotes") });
+    new Setting(parent).setName(t("settings.sectionNotes")).setHeading();
 
     new Setting(parent)
       .setName(t("settings.language"))
@@ -235,7 +295,7 @@ export class SealedNoteSettingTab extends PluginSettingTab {
   /* ---------------- security ---------------- */
 
   private renderSecurity(parent: HTMLElement): void {
-    parent.createEl("h3", { text: t("settings.sectionUnlock") });
+    new Setting(parent).setName(t("settings.sectionUnlock")).setHeading();
 
     new Setting(parent)
       .setName(t("settings.lockBlur"))
@@ -258,7 +318,7 @@ export class SealedNoteSettingTab extends PluginSettingTab {
   /* ---------------- advanced ---------------- */
 
   private renderAdvanced(parent: HTMLElement): void {
-    parent.createEl("h3", { text: t("settings.sectionAdvanced") });
+    new Setting(parent).setName(t("settings.sectionAdvanced")).setHeading();
 
     new Setting(parent)
       .setName(t("settings.offlineName"))
