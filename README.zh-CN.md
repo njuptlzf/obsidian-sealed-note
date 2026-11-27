@@ -142,6 +142,19 @@ Obsidian 隐私笔记插件：**只加密你指定的笔记和片段**，不加�
 
 ## 安装
 
+### 社区插件商店（上架后推荐）
+
+1. Obsidian 中打开 **设置 → 第三方插件（社区插件）→ 浏览**。
+2. 搜索 **Sealed Note**，安装后**启用**。
+
+### 手动安装
+
+1. 从 [最新 Release](https://github.com/njuptlzf/obsidian-sealed-note/releases/latest) 下载 `main.js`、`manifest.json`、`styles.css` 三个文件。
+2. 放进 `<你的保管库>/.obsidian/plugins/sealed-note/`（目录不存在就新建）。
+3. 如开启了受限模式请先关闭，然后在 **设置 → 第三方插件 → 已安装插件** 中启用 **Sealed Note**。
+
+### 从源码安装
+
 ```bash
 npm install
 npm run build

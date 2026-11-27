@@ -34,13 +34,26 @@ An Obsidian plugin that encrypts **only the notes and fragments you choose** —
 
 ## Installation
 
+### Community plugin store (recommended once listed)
+
+1. Open **Settings → Community plugins → Browse** in Obsidian.
+2. Search **Sealed Note** and install, then **Enable** it.
+
+### Manual install
+
+1. Download `main.js`, `manifest.json` and `styles.css` from the [latest release](https://github.com/njuptlzf/obsidian-sealed-note/releases/latest).
+2. Put all three files into `<your-vault>/.obsidian/plugins/sealed-note/` (create the folder if missing).
+3. In Obsidian, turn off Restricted mode if needed, then enable **Sealed Note** under **Settings → Community plugins → Installed plugins**.
+
+### From source
+
 ```bash
 npm install
 npm run build
 npm run deploy -- "<your-vault>"
 ```
 
-Restart Obsidian and enable **Sealed Note** under **Settings → Third-party plugins**.
+Restart Obsidian and enable **Sealed Note** under **Settings → Community plugins**.
 
 ### First run
 
