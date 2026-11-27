@@ -143,6 +143,24 @@ checkedImages && deadImages === 0
     ? fail("README contains no screenshots", "see README spec — screenshots before Features")
     : null;
 
+/* ---------- 5b. README has a user-facing install path ---------- */
+// Directory reviews reject "npm install && npm run build" as the only
+// Installation section: store/manual users get no instructions. Require a
+// release-download or plugins/<id> path, not just a build-from-source recipe.
+section("README install path");
+const readmeText = existsSync(join(root, "README.md"))
+  ? readFileSync(join(root, "README.md"), "utf8")
+  : "";
+const installBlock = readmeText.split(/^##\s+.*[Ii]nstall.*$/m)[1]?.split(/^##\s/m)[0] ?? "";
+if (!installBlock) {
+  fail("README has no Installation section");
+} else {
+  const userPath = /releases\/(latest|download)|\.obsidian[\\/]plugins[\\/]|Community plugins|community plugin store|Browse community/i.test(installBlock);
+  userPath
+    ? pass("Installation offers a user-facing path (store / release files)")
+    : fail("Installation only builds from source", "add store path and release three-file manual install (common rejection)");
+}
+
 /* ---------- 6. CI release workflow with attestation ---------- */
 section("Release workflow");
 const wfDir = join(root, ".github", "workflows");
