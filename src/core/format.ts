@@ -159,16 +159,20 @@ export function parseNoteEnvelope(text: string): NoteEnvelope | null {
     return null;
   }
   if (env.keys !== undefined) {
-    const keys = env.keys as any;
-    const valid =
-      keys &&
-      typeof keys === "object" &&
-      typeof keys.vaultId === "string" &&
-      typeof keys.epoch === "number" &&
-      keys.kdf &&
-      typeof keys.kdf.iterations === "number" &&
-      keys.slots &&
-      typeof keys.slots === "object";
+    const keys: unknown = env.keys;
+    let valid = false;
+    if (keys && typeof keys === "object") {
+      const candidate = keys as Record<string, unknown>;
+      const kdf: unknown = candidate.kdf;
+      valid =
+        typeof candidate.vaultId === "string" &&
+        typeof candidate.epoch === "number" &&
+        !!kdf &&
+        typeof kdf === "object" &&
+        typeof (kdf as Record<string, unknown>).iterations === "number" &&
+        typeof candidate.slots === "object" &&
+        candidate.slots !== null;
+    }
     // A malformed key copy must not make the whole note unreadable: the content
     // is what matters, the copy is redundancy.
     if (!valid) delete env.keys;
@@ -352,14 +356,19 @@ export function serializeNotePlain(plaintext: string): string {
 /** `sn1:...` or `` `sn1:...` `` inline payloads. */
 export function findInlinePayloads(source: string): Array<{ start: number; end: number; payload: string }> {
   const out: Array<{ start: number; end: number; payload: string }> = [];
-  const re = /`(sn1\.[A-Za-z0-9+/=]+)`|(?<![A-Za-z0-9+/=])(sn1\.[A-Za-z0-9+/=]{40,})/g;
+  // No lookbehind: iOS < 16.4 does not support it. The "not part of a larger
+  // token" check is done explicitly on the preceding character instead.
+  const re = /`(sn1\.[A-Za-z0-9+/=]+)`|(sn1\.[A-Za-z0-9+/=]{40,})/g;
   let match: RegExpExecArray | null;
   while ((match = re.exec(source)) !== null) {
-    out.push({
-      start: match.index,
-      end: match.index + match[0].length,
-      payload: (match[1] || match[2] || "").trim(),
-    });
+    const backticked = match[1] !== undefined;
+    if (!backticked) {
+      const before = match.index > 0 ? source[match.index - 1] : "";
+      if (/[A-Za-z0-9+/=]/.test(before)) continue;
+    }
+    const payload = (match[1] || match[2] || "").trim();
+    const start = backticked ? match.index + 1 : match.index;
+    out.push({ start, end: start + payload.length, payload });
   }
   return out;
 }

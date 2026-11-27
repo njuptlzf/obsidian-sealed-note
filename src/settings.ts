@@ -29,7 +29,7 @@ export interface SealedNoteSettings {
 }
 
 export const DEFAULT_SETTINGS: SealedNoteSettings = {
-  language: "auto" as Language,
+  language: "auto",
   extension: "sealed.md",
   showInlineBadges: true,
   // Highest privacy by default: the moment focus leaves the note - another

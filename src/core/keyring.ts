@@ -219,34 +219,44 @@ export function emptyKeyring(vaultId: string): KeyringData {
   };
 }
 
+/** Narrow an unknown JSON value to a plain record, or null. */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
 export function parseKeyring(text: string): KeyringData {
-  let data: any;
+  let parsed: unknown;
   try {
-    data = JSON.parse(text);
+    parsed = JSON.parse(text) as unknown;
   } catch {
     throw new Error("Keyring is not valid JSON");
   }
+  const data = asRecord(parsed);
   if (!data || data.format !== FORMAT_KEYRING) {
     throw new Error(`Unsupported keyring format: ${String(data?.format)}`);
   }
   if (!data.vaultId || typeof data.vaultId !== "string") {
     throw new Error("Keyring is missing vaultId");
   }
-  const kdf = data.kdf ?? {};
+  const kdf = asRecord(data.kdf) ?? {};
+  const hash = kdf.hash;
   if (
     typeof kdf.iterations !== "number" ||
     !Number.isInteger(kdf.iterations) ||
     kdf.iterations < MIN_ITERATIONS ||
-    !["SHA-256", "SHA-512"].includes(kdf.hash)
+    !["SHA-256", "SHA-512"].includes(String(hash))
   ) {
     throw new Error("Keyring has invalid KDF parameters");
   }
-  data.slots = data.slots ?? {};
-  data.totp = data.totp ?? { enabled: false, digits: 6, period: 30, mode: "password+totp" };
-  if (!["password", "totp", "password+totp"].includes(data.totp.mode)) data.totp.mode = "password+totp";
-  data.guard = data.guard ?? { failCount: 0, lockedUntil: null };
+  data.slots = asRecord(data.slots) ?? {};
+  const totp = asRecord(data.totp) ?? { enabled: false, digits: 6, period: 30, mode: "password+totp" };
+  if (!["password", "totp", "password+totp"].includes(String(totp.mode))) totp.mode = "password+totp";
+  data.totp = totp;
+  data.guard = asRecord(data.guard) ?? { failCount: 0, lockedUntil: null };
   data.epoch = typeof data.epoch === "number" ? data.epoch : 1;
-  return data as KeyringData;
+  return data as unknown as KeyringData;
 }
 
 export function serializeKeyring(kr: KeyringData): string {
@@ -279,27 +289,6 @@ async function wrapDek(
     wrap: { iv: toBase64(box.iv), data: toBase64(box.data) },
     updatedAt: new Date().toISOString(),
   };
-}
-
-async function unwrapDek(
-  kr: KeyringData,
-  slot: SlotId,
-  secret: string,
-): Promise<Uint8Array> {
-  const entry = kr.slots[slot];
-  if (!entry) throw new UnlockError(`${slot} is not configured`);
-  const kek = await deriveKeyFromSecret(secret, fromBase64(entry.salt), kr.kdf);
-  try {
-    const dek = await open(
-      kek,
-      { iv: fromBase64(entry.wrap.iv), data: fromBase64(entry.wrap.data) },
-      keyringAad(kr.vaultId, slot, entry.gen),
-    );
-    if (dek.length !== 32) throw new DecryptError();
-    return dek;
-  } catch {
-    throw new UnlockError("Wrong secret", true);
-  }
 }
 
 async function unwrapDekFromCredential(

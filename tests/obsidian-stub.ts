@@ -563,6 +563,8 @@ export const MarkdownView = (_shared.obsidian as any).MarkdownView;
 export const Notice = (_shared.obsidian as any).Notice;
 export const Menu = (_shared.obsidian as any).Menu;
 export const normalizePath = (_shared.obsidian as any).normalizePath;
+/** Version guard: the stub represents a modern enough app for tested paths. */
+export const requireApiVersion = (_version: string): boolean => true;
 export const getLanguage = (): string => "en";
 export const setIcon = (_shared.obsidian as any).setIcon;
 export const parseYaml = (_shared.obsidian as any).parseYaml;

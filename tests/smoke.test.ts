@@ -48,6 +48,20 @@ function installDomShim(): void {
         },
       },
       setAttribute() {},
+      /** Obsidian DOM helpers used by the UI; mirror the minimal behaviour. */
+      createEl(this: any, tag: string, opts: any = {}) {
+        const child: any = makeEl();
+        child.tag = tag;
+        if (opts.text) child.textContent = opts.text;
+        if (opts.cls) child.className = String(opts.cls);
+        return this.appendChild(child);
+      },
+      createDiv(this: any, opts: any = {}) {
+        return this.createEl("div", opts);
+      },
+      createSpan(this: any, opts: any = {}) {
+        return this.createEl("span", opts);
+      },
       appendChild(this: any, child: any) {
         child.parent = this;
         this.children.push(child);

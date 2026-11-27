@@ -13,11 +13,16 @@
  * it is removed from the DOM when hidden so nothing accumulates.
  */
 
+// File-local ambient bindings (emit no JS). They let the headless harness,
+// which only installs `document`, satisfy the same typed access path.
+declare const activeDocument: Document | undefined;
+declare const document: Document;
+
 function hostDocument(): Document | null {
-  const g = globalThis as any;
-  // Obsidian exposes `activeDocument` (follows the focused popout window).
-  // Fall back to `document` under the headless test stub.
-  return (g.activeDocument ?? g.document ?? null) as Document | null;
+  // Obsidian exposes `activeDocument` (follows the focused popout window);
+  // the Node test harness only installs the plain `document` global.
+  if (typeof activeDocument !== "undefined") return activeDocument;
+  return document;
 }
 
 export class BusyOverlay {
@@ -37,17 +42,9 @@ export class BusyOverlay {
     const doc = hostDocument();
     if (!doc?.body) return;
 
-    const el = doc.createElement("div");
-    el.className = "sealed-busy";
-
-    const ring = doc.createElement("span");
-    ring.className = "sealed-busy-ring";
-    el.appendChild(ring);
-
-    const text = doc.createElement("span");
-    text.className = "sealed-busy-label";
-    text.textContent = label;
-    el.appendChild(text);
+    const el = doc.body.createDiv({ cls: "sealed-busy" });
+    el.createSpan({ cls: "sealed-busy-ring" });
+    const text = el.createSpan({ cls: "sealed-busy-label", text: label });
 
     doc.body.appendChild(el);
     this.el = el;

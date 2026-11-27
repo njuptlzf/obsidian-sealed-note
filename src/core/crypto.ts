@@ -17,8 +17,11 @@ export const SALT_BYTES = 16;
 export const KEY_BYTES = 32;
 export const TAG_BITS = 128;
 
-const subtle: SubtleCrypto = (globalThis as any).crypto.subtle;
-const webcrypto: Crypto = (globalThis as any).crypto;
+// The Web Crypto global is available in Obsidian and in the Node-based tests
+// that exercise these primitives directly. Accessing it by its bare name keeps
+// popout windows working (no reliance on a specific window object).
+const webcrypto: Crypto = crypto;
+const subtle: SubtleCrypto = webcrypto.subtle;
 
 /**
  * TypeScript 5.7+ types Uint8Array as Uint8Array<ArrayBufferLike>, which is not
@@ -47,7 +50,7 @@ export function toBase64(bytes: Uint8Array): string {
   for (let i = 0; i < bytes.length; i += chunk) {
     binary += String.fromCharCode.apply(
       null,
-      Array.from(bytes.subarray(i, i + chunk)) as unknown as number[],
+      Array.from(bytes.subarray(i, i + chunk)),
     );
   }
   return btoa(binary);
@@ -199,7 +202,7 @@ export async function seal(
       iv: buf(iv),
       tagLength: TAG_BITS,
       ...(aad ? { additionalData: buf(utf8(aad)) } : {}),
-    } as AesGcmParams,
+    },
     key,
     buf(plaintext),
   );
@@ -218,7 +221,7 @@ export async function open(
         iv: buf(box.iv),
         tagLength: TAG_BITS,
         ...(aad ? { additionalData: buf(utf8(aad)) } : {}),
-      } as AesGcmParams,
+      },
       key,
       buf(box.data),
     );
