@@ -8,8 +8,6 @@ An Obsidian plugin that encrypts **only the notes and fragments you choose** —
 
 ![Settings page and the unlock-method picker (password + TOTP / password only / TOTP only)](docs/screenshots/settings-unlock-method.png)
 
-*Settings page with the "Choose an unlock method" modal.*
-
 ## Features
 
 - **Only what you mark is encrypted** — whole notes, inline blocks, and inline `sn1.…` fragments. The rest of the vault stays plain and searchable.
