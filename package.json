@@ -9,6 +9,7 @@
     "typecheck": "tsc -noEmit -skipLibCheck",
     "test": "node esbuild.config.mjs test && node --test dist-tests/*.test.mjs",
     "lint": "eslint .",
+    "preflight": "node scripts/preflight.mjs",
     "deploy": "node scripts/deploy.mjs"
   },
   "keywords": [
