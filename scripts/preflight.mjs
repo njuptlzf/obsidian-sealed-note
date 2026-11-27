@@ -118,6 +118,20 @@ if (!pkg) {
   } else {
     fail("eslint.config.mjs missing — community scanner rules not replicated locally");
   }
+  // obsidian's npm package peer-pins @codemirror/* to EXACT versions. A caret
+  // range on the same package resolves past the pin once a new CM release
+  // lands, and CI `npm ci` fails ERESOLVE while local builds stay green.
+  const obsidianPkgPath = join(root, "node_modules", "obsidian", "package.json");
+  if (existsSync(obsidianPkgPath)) {
+    const peers = JSON.parse(readFileSync(obsidianPkgPath, "utf8")).peerDependencies ?? {};
+    for (const [name, pinned] of Object.entries(peers)) {
+      const declared = pkg.dependencies?.[name];
+      if (declared === undefined) continue; // not a direct dep: obsidian resolves it itself
+      declared === pinned
+        ? pass(`${name} exact-pinned to obsidian peer`, `${pinned}`)
+        : fail(`${name} does not match obsidian's exact peer pin`, `declared ${declared}, obsidian pins ${pinned}`);
+    }
+  }
 }
 
 /* ---------- 5. README screenshot links (zero dead links) ---------- */
@@ -187,6 +201,16 @@ function run(label, command) {
     const out = `${e.stdout ?? ""}${e.stderr ?? ""}`.trim().split("\n").slice(-12).join("\n");
     fail(label, out || "command failed");
   }
+}
+// CI parity: the release workflow runs `npm ci` from scratch. A local
+// `npm run build` reuses the existing node_modules and will not surface an
+// ERESOLVE peer conflict (obsidian pins @codemirror/* to EXACT peer versions;
+// caret direct deps can drift above them and break CI only). --dry-run
+// resolves without touching node_modules.
+if (existsSync(join(root, "package-lock.json"))) {
+  run("npm ci --dry-run (CI install parity)", "npm ci --dry-run");
+} else {
+  fail("package-lock.json missing", "CI npm ci will fail — commit the lockfile");
 }
 if (pkg?.scripts?.lint) run("npm run lint", "npm run lint");
 if (pkg?.scripts?.typecheck) run("npm run typecheck", "npm run typecheck");
