@@ -74,10 +74,10 @@ Obsidian 在用户升级 App 后，用它判断该装哪个插件版本——比
 | 项目 | 值 |
 |---|---|
 | 仓库 | https://github.com/njuptlzf/obsidian-sealed-note |
-| 当前版本 | `2.1.0` |
-| Release | https://github.com/njuptlzf/obsidian-sealed-note/releases/tag/2.1.0 |
-| Release 附件 | `main.js`、`manifest.json`、`styles.css` |
-| 社区提交 | ⏳ 待在 community.obsidian.md 门户提交（需 Obsidian 账号登录，人工步骤） |
+| 当前版本 | `2.1.1`（修社区审核 Error：描述去 "Obsidian"、minAppVersion 1.5.0→1.8.7 对齐 `getLanguage()` 的 @since） |
+| Release | https://github.com/njuptlzf/obsidian-sealed-note/releases/tag/2.1.1 |
+| Release 附件 | `main.js`、`manifest.json`、`styles.css`（CI 构建 + artifact attestation，非手工上传） |
+| 社区提交 | 🔄 v2.1.0 首扫被拒（2 个 Error，2.1.1 已修复并自动重扫） |
 
 发版前检查清单：
 
