@@ -74,10 +74,10 @@ Obsidian 在用户升级 App 后，用它判断该装哪个插件版本——比
 | 项目 | 值 |
 |---|---|
 | 仓库 | https://github.com/njuptlzf/obsidian-sealed-note |
-| 当前版本 | `1.0.0` |
-| Release | https://github.com/njuptlzf/obsidian-sealed-note/releases/tag/1.0.0 |
+| 当前版本 | `2.1.0` |
+| Release | https://github.com/njuptlzf/obsidian-sealed-note/releases/tag/2.1.0 |
 | Release 附件 | `main.js`、`manifest.json`、`styles.css` |
-| 社区提交 | ⏳ 尚未提交（需要 Obsidian 账号） |
+| 社区提交 | ⏳ 待在 community.obsidian.md 门户提交（需 Obsidian 账号登录，人工步骤） |
 
 发版前检查清单：
 
