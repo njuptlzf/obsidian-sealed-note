@@ -16,8 +16,8 @@
  */
 
 import { t } from "../i18n";
-import { App, TFile } from "obsidian";
-import { KeyringData, keyCopyFromKeyringData, parseKeyring } from "../core/keyring";
+import { App } from "obsidian";
+import { KeyringData, keyCopyFromKeyringData } from "../core/keyring";
 import { keyCopiesEqual, noteBodyState } from "../core/format";
 import { SealedNoteStore } from "../storage/sealed-note-store";
 import { log } from "../util/log";

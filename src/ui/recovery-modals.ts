@@ -32,9 +32,9 @@ export class CandidatePickerModal extends Modal {
     const list = contentEl.createDiv({ cls: "sealed-candidate-list" });
     for (const candidate of this.candidates) {
       const item = list.createDiv({ cls: "sealed-candidate" });
-      item.createEl("div", { text: candidate.file.path, cls: "sealed-candidate-path" });
+      item.createDiv({ text: candidate.file.path, cls: "sealed-candidate-path" });
       const slots = Object.keys(candidate.keyCopy.slots);
-      item.createEl("div", {
+      item.createDiv({
         text: t("recovery.epochSlots", { epoch: candidate.keyCopy.epoch, slots: slots.join(" / ") }),
         cls: "sealed-hint",
       });

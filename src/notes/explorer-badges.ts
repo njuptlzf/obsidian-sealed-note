@@ -16,6 +16,7 @@ export interface BadgeTitleElement {
   firstChild?: Node | null;
   querySelector(selector: string): Element | null;
   insertBefore(node: Node, ref: Node | null): Node;
+  createSpan(options: { cls: string; text: string }): HTMLElement;
 }
 
 /** Apply/refresh badges under `root`. Returns the number of rows changed. */
@@ -29,9 +30,7 @@ export function applyExplorerBadges(root: HTMLElement, sealedPaths: Set<string>)
     const existing = el.querySelector(".sealed-nav-lock");
     if (sealedPaths.has(path)) {
       if (!existing) {
-        const badge = document.createElement("span");
-        badge.className = "sealed-nav-lock";
-        badge.textContent = "🔒";
+        const badge = el.createSpan({ cls: "sealed-nav-lock", text: "🔒" });
         badge.setAttribute("aria-hidden", "true");
         // Before the name span so the lock sits at the start of the row.
         const content = el.querySelector(".nav-file-title-content");

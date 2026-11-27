@@ -83,23 +83,22 @@ export function setCiphertextGuardUnlockHandler(handler: () => void): void {
 
 class LockedBannerWidget extends WidgetType {
   toDOM(): HTMLElement {
-    const box = document.createElement("div");
-    box.className = "sealed-editor-banner";
+    const box = createDiv({ cls: "sealed-editor-banner" });
 
-    const hint = document.createElement("div");
-    hint.className = "sealed-editor-banner-text";
-    hint.textContent = t("locked.editorHint");
-    box.appendChild(hint);
+    box.createDiv({
+      cls: "sealed-editor-banner-text",
+      text: t("locked.editorHint"),
+    });
 
-    const btn = document.createElement("button");
-    btn.className = "mod-cta sealed-editor-banner-btn";
-    btn.textContent = t("locked.unlock");
-    btn.addEventListener("click", (event) => {
+    const btn = box.createEl("button", {
+      cls: "mod-cta sealed-editor-banner-btn",
+      text: t("locked.unlock"),
+    });
+    btn.addEventListener("click", (event: MouseEvent) => {
       event.preventDefault();
       event.stopPropagation();
       unlockHandler?.();
     });
-    box.appendChild(btn);
     return box;
   }
 
@@ -141,11 +140,7 @@ const lockedField = StateField.define<boolean>({
  * plugins' dispatches and our reveal/reseal all pass without depending on
  * how Obsidian annotates its internal transactions.
  */
-export function envelopeChangeFilter(tr: {
-  docChanged: boolean;
-  annotation: (key: unknown) => unknown;
-  startState: { doc: { toString(): string } };
-}): boolean {
+export function envelopeChangeFilter(tr: Transaction): boolean {
   if (!tr.docChanged) return true;
   if (Date.now() < syncWindowUntil) return true; // body swap in progress
   if (tr.annotation(allowEnvelopeWrite) === true) return true;
@@ -154,5 +149,5 @@ export function envelopeChangeFilter(tr: {
 }
 
 export function ciphertextGuard(): Extension[] {
-  return [lockedField, EditorState.changeFilter.of(envelopeChangeFilter as any)];
+  return [lockedField, EditorState.changeFilter.of(envelopeChangeFilter)];
 }

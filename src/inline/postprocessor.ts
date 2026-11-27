@@ -26,7 +26,7 @@ async function decorate(
   ctx: MarkdownPostProcessorContext,
 ): Promise<void> {
   // Walk text nodes so we do not fight with the rest of the rendered DOM.
-  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+  const walker = activeDocument.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
     acceptNode: (node) =>
       node.nodeValue && PAYLOAD_RE.test(node.nodeValue)
         ? NodeFilter.FILTER_ACCEPT
@@ -46,19 +46,19 @@ async function decorate(
     if (!PAYLOAD_RE.test(text)) continue;
     PAYLOAD_RE.lastIndex = 0;
 
-    const fragment = document.createDocumentFragment();
+    const fragment = activeDocument.createDocumentFragment();
     let lastIndex = 0;
     let match: RegExpExecArray | null;
     PAYLOAD_RE.lastIndex = 0;
     while ((match = PAYLOAD_RE.exec(text)) !== null) {
       if (match.index > lastIndex) {
-        fragment.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+        fragment.appendChild(activeDocument.createTextNode(text.slice(lastIndex, match.index)));
       }
       fragment.appendChild(buildPill(plugin, match[1], ctx));
       lastIndex = match.index + match[0].length;
     }
     if (lastIndex < text.length) {
-      fragment.appendChild(document.createTextNode(text.slice(lastIndex)));
+      fragment.appendChild(activeDocument.createTextNode(text.slice(lastIndex)));
     }
     node.parentNode?.replaceChild(fragment, node);
   }
@@ -69,15 +69,16 @@ function buildPill(
   payload: string,
   ctx: MarkdownPostProcessorContext,
 ): HTMLElement {
-  const pill = document.createElement("span");
+  const pill = activeDocument.createElement("span");
   pill.className = "sealed-pill";
   const cipherLabel = t("menu.cipherPill");
   pill.setText?.(cipherLabel);
   pill.textContent = cipherLabel;
   pill.setAttribute("title", t("menu.clickDecrypt"));
-  pill.addEventListener("click", async (event) => {
+  pill.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
+    void (async () => {
     try {
       const dek = await plugin.unlockService.dekFor(ctx.sourcePath, {
         subject: ctx.sourcePath.split("/").pop() ?? "",
@@ -104,6 +105,7 @@ function buildPill(
     } catch (error) {
       new Notice(describeError(error), 6000);
     }
+    })();
   });
   return pill;
 }

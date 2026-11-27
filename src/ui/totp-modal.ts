@@ -63,9 +63,11 @@ export class TotpSetupModal extends Modal {
     box.setText(formatSecret(this.secret, 4));
 
     const copyBtn = contentEl.createEl("button", { text: t("totp.copyKey"), cls: "sealed-btn" });
-    copyBtn.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(this.secret);
-      new Notice(t("totp.keyCopied"));
+    copyBtn.addEventListener("click", () => {
+      void (async () => {
+        await navigator.clipboard.writeText(this.secret);
+        new Notice(t("totp.keyCopied"));
+      })();
     });
 
     contentEl.createEl("p", {

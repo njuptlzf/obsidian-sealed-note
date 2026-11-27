@@ -44,10 +44,11 @@ async function renderEncryptedBlock(
     const btn = card.createEl("button", { cls: "sealed-block-lock" });
     setIcon(btn, "lock-open");
     btn.createSpan({ text: t("card.unsealedTitle") });
-    card.createEl("div", { text: t("card.unsealedHint"), cls: "sealed-hint" });
+    card.createDiv({ text: t("card.unsealedHint"), cls: "sealed-hint" });
     const seal = card.createEl("button", { text: t("card.unsealedSeal"), cls: "sealed-btn" });
-    seal.addEventListener("click", async () => {
+    seal.addEventListener("click", () => {
       seal.disabled = true;
+      void (async () => {
       try {
         // Seal the file's plaintext blocks through the same path the leaving
         // hooks use: read current bytes, encrypt each unsealed block, one
@@ -64,6 +65,7 @@ async function renderEncryptedBlock(
       } finally {
         seal.disabled = false;
       }
+      })();
     });
     return;
   }
@@ -91,9 +93,11 @@ async function renderEncryptedBlock(
 
       const bar = card.createDiv({ cls: "sealed-block-bar" });
       const copy = bar.createEl("button", { text: t("block.copy"), cls: "sealed-btn" });
-      copy.addEventListener("click", async () => {
-        await navigator.clipboard.writeText(plain);
-        new Notice(t("block.copied"));
+      copy.addEventListener("click", () => {
+        void (async () => {
+          await navigator.clipboard.writeText(plain);
+          new Notice(t("block.copied"));
+        })();
       });
       const hide = bar.createEl("button", { text: t("block.hide"), cls: "sealed-btn" });
       hide.addEventListener("click", () => {

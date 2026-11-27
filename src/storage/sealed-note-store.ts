@@ -80,7 +80,7 @@ export class SealedNoteStore {
     this.vaultPaths.clear();
     try {
       const index = await this.app.vault.adapter.read(this.vaultIndexPath);
-      const paths = JSON.parse(index);
+      const paths: unknown = JSON.parse(index) as unknown;
       if (Array.isArray(paths)) {
         for (const p of paths) {
           if (typeof p === "string" && this.app.vault.getAbstractFileByPath(p)) {

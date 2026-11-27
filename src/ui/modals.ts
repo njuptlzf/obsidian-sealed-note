@@ -3,7 +3,7 @@
  * so the promise we make is stated once.
  */
 
-import { App, Modal, Notice, Setting, TextComponent } from "obsidian";
+import { App, Modal, Notice, Setting } from "obsidian";
 import { ProviderId, UnlockProvider } from "../core/providers";
 import { UnlockPrompt } from "../services/unlock-service";
 import { groupRecovery } from "../core/recovery";
@@ -397,9 +397,11 @@ export class RecoveryKeyModal extends Modal {
 
     const actions = contentEl.createDiv({ cls: "sealed-actions sealed-actions-wrap" });
     const copy = actions.createEl("button", { text: t("recovery.copy") });
-    copy.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(formatted);
-      new Notice(t("recovery.copied"));
+    copy.addEventListener("click", () => {
+      void (async () => {
+        await navigator.clipboard.writeText(formatted);
+        new Notice(t("recovery.copied"));
+      })();
     });
 
     const download = actions.createEl("button", { text: t("recovery.download") });
@@ -416,7 +418,7 @@ export class RecoveryKeyModal extends Modal {
       ].join("\n");
       const blob = new Blob([body], { type: "text/plain;charset=utf-8" });
       const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
+      const a = activeDocument.createElement("a");
       a.href = url;
       a.download = `sealed-note-recovery-${Date.now()}.txt`;
       a.click();

@@ -18,15 +18,9 @@
  * to know where the key material actually lives.
  */
 
-import { App, TFile, normalizePath } from "obsidian";
+import { App, TFile } from "obsidian";
 import { KeyCopy, NoteEnvelope, keyCopiesEqual, noteBodyState } from "../core/format";
-import {
-  KeyringData,
-  KeyringSlot,
-  SlotId,
-  formatKeyringFromCopy,
-  keyCopyFromKeyringData,
-} from "../core/keyring";
+import { KeyringData, formatKeyringFromCopy, keyCopyFromKeyringData } from "../core/keyring";
 import { SealedNoteStore } from "../storage/sealed-note-store";
 import { log } from "../util/log";
 import { Err } from "../util/errors";

@@ -847,6 +847,15 @@ test("badges: applyExplorerBadges adds, keeps and removes lock spans", async () 
         node.parent = el;
         return node;
       },
+      createSpan(opts: any) {
+        const span: any = { className: opts.cls, textContent: opts.text, attrs: {}, children: [], parent: null };
+        span.setAttribute = (k: string, v: string) => { span.attrs[k] = v; };
+        span.remove = () => {
+          const idx = children.indexOf(span);
+          if (idx >= 0) children.splice(idx, 1);
+        };
+        return span;
+      },
     };
     children.push(content);
     return el;

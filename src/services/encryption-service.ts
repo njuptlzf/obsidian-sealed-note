@@ -136,7 +136,7 @@ export class EncryptionService {
     }
 
     // Drop the sentinels we added, leaving the original ciphertext untouched.
-    text = text.replace(/\u0000/g, "");
+    text = text.split(String.fromCharCode(0)).join("");
 
     this.log.info("decrypt_all", { fenced: fences.length, inline: inlineHits.length, failed });
     return { text, fenced: fences.length, inline: inlineHits.length, failed };

@@ -44,8 +44,8 @@ export class UnlockModeModal extends Modal {
 
     for (const option of MODE_OPTIONS) {
       const card = contentEl.createDiv({ cls: "sealed-mode-option" });
-      card.createEl("div", { text: option.title, cls: "sealed-mode-title" });
-      card.createEl("div", { text: option.desc, cls: "sealed-hint" });
+      card.createDiv({ text: option.title, cls: "sealed-mode-title" });
+      card.createDiv({ text: option.desc, cls: "sealed-hint" });
       const btn = card.createEl("button", {
         text: option.id === "password" ? t("mode.switch") : t("settings.configure"),
         cls: "mod-cta",
@@ -116,14 +116,13 @@ export class PasswordPromptModal extends Modal {
   }
 
   private submit(): void {
-    const content = this.contentEl as any;
-    const errEl = content.querySelector?.(".sealed-error");
+    const errEl = this.contentEl.querySelector<HTMLElement>(".sealed-error");
     if (this.value.length < 10) {
-      if (errEl) errEl.setText(t("common.min10"));
+      errEl?.setText(t("common.min10"));
       return;
     }
     if (this.value !== this.confirm) {
-      if (errEl) errEl.setText(t("setup.mismatch"));
+      errEl?.setText(t("setup.mismatch"));
       return;
     }
     this.settled = true;

@@ -22,7 +22,6 @@ import {
   credentialFor,
   unlockFromCredential,
   setSlot,
-  removeSlot,
 } from "../core/keyring";
 import { NoteKeyringStore } from "../storage/note-keyring-store";
 import { ProviderId, UnlockProvider, UnlockAttempt, providersAvailable, needsCode, getProvider } from "../core/providers";

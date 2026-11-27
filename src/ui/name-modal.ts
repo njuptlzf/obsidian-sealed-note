@@ -28,7 +28,7 @@ export class NameModal extends Modal {
     input.type = "text";
     input.value = this.defaultValue;
     input.placeholder = this.label;
-    input.addEventListener("input", () => (this.value = (input as HTMLInputElement).value));
+    input.addEventListener("input", () => (this.value = input.value));
     input.addEventListener("keydown", (e) => {
       if (e.key === "Enter") this.submit();
     });
@@ -41,8 +41,8 @@ export class NameModal extends Modal {
       .createEl("button", { text: t("common.create"), cls: "mod-cta" })
       .addEventListener("click", () => this.submit());
     window.setTimeout(() => {
-      (input as HTMLInputElement).focus();
-      (input as HTMLInputElement).select();
+      input.focus();
+      input.select();
     }, 30);
   }
 
