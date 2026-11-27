@@ -2943,3 +2943,20 @@ test("modify on a plain-looking path that holds an envelope re-registers it", as
   assert.equal(plugin.notes.isSealedPath(path), true, "the envelope body re-registered the note");
   plugin.onunload();
 });
+
+test("guard swallows a cancellation error without showing an error notice", async () => {
+  const { plugin, harness } = await boot();
+  const { Err } = await import("../src/util/errors");
+
+  const before = harness.notices.length;
+  await plugin.guard(async () => {
+    throw Err.cancelled();
+  });
+
+  assert.equal(
+    harness.notices.length,
+    before,
+    "a user cancellation must not surface an error toast",
+  );
+  plugin.onunload();
+});

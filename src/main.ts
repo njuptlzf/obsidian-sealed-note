@@ -37,7 +37,7 @@ import { applyExplorerBadges } from "./notes/explorer-badges";
 import { ciphertextGuard, openCiphertextSyncWindow, setCiphertextGuardUnlockHandler } from "./editor/ciphertext-guard";
 import { generateRecoveryKey } from "./core/recovery";
 import { createKeyring, createKeyringWithoutPassword, formatKeyringFromCopy, keyFingerprint, newVaultId, SLOT_PASSWORD, SLOT_TOTP, SLOT_PASSWORD_TOTP, SLOT_RECOVERY, KeyringData, setSlot } from "./core/keyring";
-import { describeError, Err } from "./util/errors";
+import { describeError, Err, SealedNoteError } from "./util/errors";
 import { log, setLogLevel } from "./util/log";
 import { findUnsealedBlocks } from "./core/format";
 import { TotpSetupModal } from "./ui/totp-modal";
@@ -1050,7 +1050,9 @@ export default class SealedNotePlugin extends Plugin {
     try {
       await action();
     } catch (error) {
-      if (error instanceof Error && error.name === "E_CANCELLED") return;
+      // SealedNoteError carries its stable identifier in `code`; `name` is
+      // always "SealedNoteError", so checking `name` never matched a cancel.
+      if (error instanceof SealedNoteError && error.code === "E_CANCELLED") return;
       this.log.error("action_failed", { error: String(error), stack: error instanceof Error ? error.stack : undefined });
       new Notice(describeError(error), 8000);
     }
