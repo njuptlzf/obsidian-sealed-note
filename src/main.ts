@@ -158,6 +158,10 @@ export default class SealedNotePlugin extends Plugin {
     this.keyCopies = new KeyCopyRefreshService(this.app, this.notes);
 
     this.unlockService = new UnlockService(this.keyringStore, this.sessions);
+    // A DEK cache for a plain note (reading-view block/pill decrypt) must know
+    // which leaf showed it, or the close-policy sweep cannot see the tab close
+    // and the cache outlives its note (reopened note reveals without a prompt).
+    this.unlockService.onSessionCached = (path) => this.rememberLeafFor(path);
     this.unlockService.setUi(() => ({
       prompt: (request) =>
         new Promise((resolve) => {
@@ -1011,6 +1015,9 @@ export default class SealedNotePlugin extends Plugin {
     if (!this.app.workspace.iterateAllLeaves) return; // unknown API: do not guess
     for (const path of this.sessions.unlockedPaths()) {
       if (this.anyLeafShows(path)) continue; // its tab is still open somewhere
+      if (this.unsealedNotes.has(path)) continue; // plaintext blocks: the seal
+      // sweep owns this path's end-of-life (seal first, then drop the cache),
+      // locking here first would strand the seal without its cached key.
       const leaf = this.unlockedLeaves.get(path);
       if (!leaf) continue; // no reliable leaf: do not guess, other hooks still lock
       if (this.leafAlive(leaf)) continue; // switched away, not closed
@@ -1712,6 +1719,16 @@ export default class SealedNotePlugin extends Plugin {
       this.unsealedLeaves.delete(path);
       void this.guard(async () => {
         await this.sealPlainNote(path, { interactive: true });
+        // The tab is gone, so the note's DEK cache retires with it - even if
+        // the seal was cancelled and the trail stays. The session sweep above
+        // deliberately skipped this path so the seal could run on the cached
+        // key; without this drop the cache would outlive its tab and a
+        // reopened note would decrypt blocks without asking. (Sealing its
+        // own blocks on a live session is covered by the blur-path tests;
+        // each session holds a private DEK copy, so wiping this entry cannot
+        // damage another note's session.)
+        this.sessions.lock(path);
+        this.refreshStatusBar();
       });
     }
   }
@@ -1764,6 +1781,7 @@ export default class SealedNotePlugin extends Plugin {
     if (!dek) return;
 
     const result = await this.encryption.encryptInline(dek, selection, as);
+    openCiphertextSyncWindow();
     editor.replaceSelection(result.snippet);
     new Notice(as === "fence" ? t("notice.encryptedFence") : t("notice.encryptedInline"));
     this.log.info("selection_encrypted", { path: file.path, as });
@@ -1791,6 +1809,9 @@ export default class SealedNotePlugin extends Plugin {
       this.log.info("selection_decrypted_to_clipboard", { path: file.path });
       return;
     }
+    // The replacement INTERSECTS the ciphertext regions the guard protects:
+    // open the sync window so our own intended rewrite passes the filters.
+    openCiphertextSyncWindow();
     editor.replaceSelection(plain);
     new Notice(t("notice.decrypted"), 6000);
     // A decrypted FENCE leaves plaintext inside an encrypted_txt block. The

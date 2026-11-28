@@ -9,6 +9,14 @@ import { t, LANGUAGE_OPTIONS } from "../i18n";
 import type { Language } from "../i18n";
 import type { LockPolicy } from "../settings";
 
+/** i18n keys of the private-block quick guide, in render order. */
+const BLOCK_HELP_KEYS = [
+  "settings.blockHelp1",
+  "settings.blockHelp2",
+  "settings.blockHelp3",
+  "settings.blockHelp4",
+] as const;
+
 export class SealedNoteSettingTab extends PluginSettingTab {
   constructor(
     app: App,
@@ -38,6 +46,20 @@ export class SealedNoteSettingTab extends PluginSettingTab {
         name: t("settings.showBadges"),
         desc: t("settings.showBadgesDesc"),
         control: { type: "toggle", key: "showInlineBadges" },
+      },
+      {
+        // Info row: declarative `desc` strings render as one paragraph, which
+        // buries a four-part guide. `render` gives us per-line <p> elements;
+        // the joined `desc` still feeds settings search (textContent is used).
+        name: t("settings.blockHelpTitle"),
+        desc: BLOCK_HELP_KEYS.map((key) => t(key)).join(" "),
+        aliases: t("settings.blockHelpAliases").split(",").map((s) => s.trim()),
+        render: (setting) => {
+          setting.descEl.empty();
+          for (const key of BLOCK_HELP_KEYS) {
+            setting.descEl.createEl("p", { text: t(key), cls: "sealed-hint" });
+          }
+        },
       },
       {
         name: t("settings.confirmDecrypt"),
@@ -280,6 +302,17 @@ export class SealedNoteSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }),
       );
+
+    // Mirror of the declarative info row above (both paths must stay in sync):
+    // the private-block quick guide, one <p> per point.
+    // Same pattern as inline/postprocessor.ts: activeDocument keeps popout
+    // windows on their own document, and createFragment is a runtime global
+    // (not a module export), so the typed API is activeDocument here.
+    const helpFrag = activeDocument.createDocumentFragment();
+    for (const key of BLOCK_HELP_KEYS) {
+      helpFrag.createEl("p", { text: t(key), cls: "sealed-hint" });
+    }
+    new Setting(parent).setName(t("settings.blockHelpTitle")).setDesc(helpFrag);
 
     new Setting(parent)
       .setName(t("settings.confirmDecrypt"))

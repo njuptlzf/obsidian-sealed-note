@@ -99,6 +99,16 @@ export class UnlockService {
     private readonly sessions: SessionStore,
   ) {}
 
+  /**
+   * Fired after interactiveUnlock caches a fresh session under `filePath`.
+   * Plain notes get here through the reading-view block/pill decrypt path:
+   * the resulting entry is a DEK *cache*, and the plugin must bind it to the
+   * visible leaf, or the "close" policy sweep has no leaf to watch and the
+   * cache outlives its tab (a reopened note then shows plaintext without a
+   * prompt). Wired by the plugin; optional so tests keep a bare service.
+   */
+  onSessionCached: ((filePath: string) => void) | null = null;
+
   /** Wired by the plugin after the UI layer exists (avoids a circular import). */
   setUi(factory: () => UnlockUi): void {
     this.uiFactory = factory;
@@ -141,7 +151,13 @@ export class UnlockService {
    */
   async dekFor(filePath: string, request?: UnlockRequest): Promise<Uint8Array | null> {
     const cached = this.sessions.get(filePath);
-    if (cached) return cached.dek;
+    if (cached) {
+      // Re-bind the visible leaf on a cache hit too: an entry that predates
+      // the leaf binding (or lost its tab record) gets picked back up, so
+      // the close-policy sweep can retire it when its tab closes.
+      this.onSessionCached?.(filePath);
+      return cached.dek;
+    }
 
     const kr = await this.requireKeyring();
     const available = providersAvailable(kr);
@@ -243,6 +259,7 @@ export class UnlockService {
         registerSuccess(kr.guard);
         await this.keyringStore.save(kr).catch(() => undefined);
         this.sessions.put(filePath, dek, provider.id);
+        this.onSessionCached?.(filePath);
         this.log.info("unlock_ok", { path: filePath, provider: provider.id });
         return dek;
         } catch (error) {

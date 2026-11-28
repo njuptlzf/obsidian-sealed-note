@@ -16,13 +16,13 @@ An Obsidian plugin that encrypts **only the notes and fragments you choose** —
 
 ## Features
 
-- **Only what you mark is encrypted** — whole notes, inline blocks, and inline `sn1.…` fragments. The rest of the vault stays plain and searchable.
+- **Only what you mark is encrypted** — whole notes, private blocks (` ```encrypted_txt ` fences in normal notes), and inline `sn1.…` fragments. The rest of the vault stays plain and searchable. A quick guide for blocks lives in the plugin settings under *Notes*.
 - **Password can be reset, never recovered** — anyone claiming to recover your password either deceives you or kept a backdoor. Here the recovery key rewraps the same data key; note content is never re-encrypted.
 - **No keyring file, no sidecar** — the wrapped key lives in the `keys` field of every locked note's own body, so it syncs with your notes and any one note can unlock the whole vault. There is no `sealed-data/` folder and no annotation to maintain.
 - **Lock any note in place** — right-click any Markdown note → *Lock this document in place*. The filename stays exactly as it is; only the body becomes ciphertext. No custom view, no renamed copy.
 - **Locked notes are marked in the file explorer** — a 🔒 prefix on every private note, so you can tell at a glance which files need a password. *Turn this private note into a normal note* removes the mark and the protection in one step.
 - **Native Markdown editing** — a locked note opens in the normal editor showing its ciphertext. Unlock writes plaintext **in place** into the note's own body: source mode, live preview, immersive mode and every editor command work as usual. There is never a second plaintext file on disk.
-- **Ciphertext cannot be damaged by accident** — while the buffer holds an envelope, typing, pasting, dropping and undo are refused at the editor level (content-based, any filename), and a banner at the top offers *Unlock and edit*. One stray keystroke can never corrupt a note into undecryptability.
+- **Ciphertext cannot be damaged by accident** — while the buffer holds an envelope, typing, pasting, dropping and undo are refused at the editor level (content-based, any filename), and a banner at the top offers *Unlock and edit*. Sealed `sn1.…` blocks and inline payloads inside ORDINARY notes are protected the same way, region by region: the rest of the note stays editable, but keystrokes that would touch the ciphertext are refused and the payload is marked with a dashed underline and a tooltip. One stray keystroke can never corrupt a note into undecryptability.
 - **Three unlock modes, switchable any time** — password only, TOTP only, or password + TOTP as strict two-factor (no password-only door exists in that mode). The recovery key is always the last-resort channel.
 - **Automatic locking** — a three-tier policy (blur / close note / per-session) decides when an unlocked note re-encrypts and drops its key, defaulting to the strictest: lock on any focus loss.
 - **Offline emergency decrypt** — a single self-contained `tools/decrypt.html` that needs no network, for verifying backups or decrypting on a machine without Obsidian.
@@ -100,9 +100,9 @@ Settings → Sealed Note → **When an unlocked note re-locks**:
 
 **Deleting a note** deletes its ciphertext with it, since they are the same file. Ordinary file backup / version history is the recovery path, exactly as for any other note.
 
-### Inline encrypted blocks
+### Private blocks (inline encrypted blocks)
 
-Just type plaintext in a fenced block in a normal note:
+Write plaintext in a fenced block in any normal note (the settings page carries the same quick guide under *Notes* — search "private block" to find it):
 
 ````markdown
 ```encrypted_txt
@@ -110,10 +110,11 @@ my secret text
 ```
 ````
 
-- **Sealed automatically when you leave** (switch note/tab, window blur, open settings, switch to reading view, or close the tab) — the same timing as a private note's lock policy. Once unlocked in this session, sealing is silent; the block is rewritten to `sn1.…` ciphertext in place. If the key is gone, you are asked once.
+- **Sealed automatically when you leave** (switch note/tab, window blur, open settings, switch to reading view, or close the tab) — the same timing as a private note's lock policy, including *close note to lock*: closing the tab retires the cached key, so reopening asks for the credential again. Once unlocked in this session, sealing is silent; the block is rewritten to `sn1.…` ciphertext in place. If the key is gone, you are asked once.
+- **Sealed ciphertext is tamper-proof in source mode** — typing over the `sn1.…` bytes (or deleting the fence) is refused; the payload carries a dashed underline + tooltip. Decrypt the selection first if you want to change it.
 - **Nothing is deleted on cancel.** The block stays plaintext, the status bar keeps a `⚠` warning, and the next visit asks again. Obsidian cannot veto a view switch, so the warning is the honest fallback.
 - **Reading view** shows `🔓 Not encrypted yet` with an **Encrypt this block** button — click it to seal on demand. Already-sealed blocks show `🔒 Encrypted content`; click to decrypt (on screen only, file untouched).
-- Aliases: `txt_encrypted`, `sealed`. You can also select text → right-click → **Encrypt selection** to seal immediately without waiting for a leave point.
+- Aliases: `txt_encrypted`, `sealed`. You can also select text → right-click / command palette → **"Encrypt selection (as block)"** to seal immediately without waiting for a leave point.
 
 ### Inline ciphertext
 

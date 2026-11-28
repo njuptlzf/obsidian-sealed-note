@@ -568,3 +568,24 @@ export const requireApiVersion = (_version: string): boolean => true;
 export const getLanguage = (): string => "en";
 export const setIcon = (_shared.obsidian as any).setIcon;
 export const parseYaml = (_shared.obsidian as any).parseYaml;
+/**
+ * Obsidian's createFragment is document.createDocumentFragment() with the
+ * createEl extensions on it. Tests run under a DOM shim, so fall back to a
+ * makeEl-style container when the shim has no real fragment support.
+ */
+export const createFragment = (): any => {
+  const doc: any = (globalThis as any).document;
+  if (doc && typeof doc.createDocumentFragment === "function") return doc.createDocumentFragment();
+  const frag: any = { children: [] as any[] };
+  frag.appendChild = (c: any) => {
+    frag.children.push(c);
+    return c;
+  };
+  frag.createEl = (tag: string, opts: any = {}) => {
+    const el: any = { tag, textContent: opts.text ?? "", children: [] };
+    el.addClass = () => el;
+    frag.appendChild(el);
+    return el;
+  };
+  return frag;
+};

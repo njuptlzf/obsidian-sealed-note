@@ -84,6 +84,10 @@ function installDomShim(): void {
         return el;
       },
       createTreeWalker: () => ({ nextNode: () => null }),
+      createDocumentFragment: () => {
+        const f = makeEl();
+        return f;
+      },
       querySelector: () => null,
       // CodeMirror probes documentElement.style at module init for browser
       // detection; without this the real plugin import throws headless.
@@ -2255,6 +2259,109 @@ test("the close policy locks exactly when the note's tab is destroyed", async ()
   assert.equal(plugin.isUnlocked(file.path), false, "closing the tab locks the note");
   assert.ok(!harness.files.get(file.path)!.includes("secret-abc"), "plaintext flushed out on tab close");
   assert.equal(await plugin.notes.readPlaintext(file, dek, vaultId), "# 标签内 secret-abc", "content preserved in the payload");
+  plugin.onunload();
+});
+
+test("the close policy drops a plain-note DEK cache when its tab is destroyed", async () => {
+  // Regression: clicking a sealed ```encrypted_txt block in a plain note
+  // caches the DEK under that note's path. Under "close", the sweep that
+  // retires the cache needed the visible leaf - which dekFor() never
+  // recorded - so the cache outlived the tab and a reopened note decrypted
+  // every block without ever asking for the password again.
+  const { plugin, harness } = await boot();
+  const dek = await seedInlineKey(plugin);
+  plugin.settingsData.lockPolicy = "close";
+
+  const path = "Plain/policy.md";
+  const { sealInline, wrapFenced } = await import("../src/core/format");
+  harness.files.set(path, `intro\n${wrapFenced(await sealInline(dek, plugin.vaultIdentifier, "块内 secret-xyz"))}\nend\n`);
+
+  let prompts = 0;
+  plugin.unlockService.setUi(() => ({
+    prompt: async () => {
+      prompts++;
+      return { providerId: "password", secret: "pw-1234567890" };
+    },
+  }));
+
+  // The note is visible in one markdown leaf; the reader clicks the block.
+  const noteLeaf: any = {
+    view: { getViewType: () => "markdown", file: { path, basename: "policy" } },
+    parent: harness.app.workspace.rootSplit,
+  };
+  harness.app.workspace.markdownLeaves.push(noteLeaf);
+  const got = await plugin.unlockService.dekFor(path, { subject: "policy" });
+  assert.ok(got, "first decrypt asked and succeeded");
+  assert.equal(prompts, 1, "one credential prompt");
+  assert.equal(plugin.isUnlocked(path), true, "DEK cache live while the tab is open");
+
+  // Same tab still open: cache stays (policy says so).
+  harness.app.workspace.triggerLayoutChange();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(plugin.isUnlocked(path), true, "open tab keeps the cache");
+
+  // Close the tab: the cache must retire with it.
+  const idx = harness.app.workspace.markdownLeaves.indexOf(noteLeaf);
+  harness.app.workspace.markdownLeaves.splice(idx, 1);
+  harness.app.workspace.triggerLayoutChange();
+  for (let i = 0; i < 50 && plugin.isUnlocked(path); i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(plugin.isUnlocked(path), false, "closing the tab dropped the DEK cache");
+
+  // Reopen and click again: must ask for the credential a second time.
+  harness.app.workspace.markdownLeaves.push(noteLeaf);
+  const again = await plugin.unlockService.dekFor(path, { subject: "policy" });
+  assert.ok(again, "second decrypt still works after re-auth");
+  assert.equal(prompts, 2, "the reopened note demanded the password again");
+  plugin.sessions.lock(path);
+  plugin.onunload();
+});
+
+test("closing a trail note seals its plaintext blocks before the cache sweep drops the key", async () => {
+  // The two close-policy sweeps race by design: block sealing needs the
+  // cached DEK, the session sweep deletes it. The session sweep must skip
+  // trail notes so sealPlainNote (which drops the entry itself afterwards)
+  // can still seal silently.
+  const { plugin, harness } = await boot();
+  const dek = await seedInlineKey(plugin);
+  plugin.settingsData.lockPolicy = "close";
+
+  const path = "Plain/close-seal.md";
+  harness.files.set(path, "```encrypted_txt\nleave-time secret\n```\n");
+
+  const noteLeaf: any = {
+    view: { getViewType: () => "markdown", file: { path, basename: "close-seal" } },
+    parent: harness.app.workspace.rootSplit,
+  };
+  harness.app.workspace.markdownLeaves.push(noteLeaf);
+
+  // Register the trail through the real vault:modify hook, which fills
+  // unsealedNotes AND remembers the showing leaf exactly as production does.
+  const modify = harness.registered.events.find((e) => e.name === "vault:modify")!;
+  const { TFile } = await import("./obsidian-stub");
+  await modify.fn(new TFile(path));
+  for (let i = 0; i < 50 && !(plugin as any).unsealedNotes.has(path); i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal((plugin as any).unsealedNotes.has(path), true, "trail registered with its leaf");
+
+  plugin.sessions.put(path, dek, "password"); // unlocked this session: seal is silent
+  // A prompt would cancel: succeeding at all proves the seal ran while the
+  // close sweep kept the cached DEK alive for the seal sweep.
+  plugin.unlockService.dekFor = async () => null;
+
+  // Close the tab: layout-change runs the session sweep, then the seal sweep.
+  const idx = harness.app.workspace.markdownLeaves.indexOf(noteLeaf);
+  harness.app.workspace.markdownLeaves.splice(idx, 1);
+  harness.app.workspace.triggerLayoutChange();
+  for (let i = 0; i < 50 && (plugin as any).unsealedNotes.has(path); i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  const out = harness.files.get(path)!;
+  assert.ok(out.includes("sn1."), "block sealed at the tab-close point");
+  assert.ok(!out.includes("leave-time secret"), "no plaintext left on disk");
+  assert.equal(plugin.isUnlocked(path), false, "DEK cache retired with the tab");
   plugin.onunload();
 });
 
