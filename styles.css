@@ -149,6 +149,17 @@
 /* Banner shown at the top of an editor whose buffer holds a ciphertext
    envelope. The changeFilter in ciphertext-guard.ts is what actually stops
    edits; this is the visible explanation plus the unlock action. */
+/* Sealed sn1 ciphertext inside an ordinary note's source view: the guard
+   refuses user edits over these spans, and this is the visible explanation
+   (dashed amber underline + tooltip from sealedCipherRanges decorations). */
+.sealed-cipher-locked {
+  text-decoration: underline dashed;
+  text-decoration-color: var(--color-orange, #b58900);
+  text-underline-offset: 3px;
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
 .sealed-editor-banner {
   display: flex;
   align-items: center;

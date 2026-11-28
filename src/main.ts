@@ -1781,6 +1781,7 @@ export default class SealedNotePlugin extends Plugin {
     if (!dek) return;
 
     const result = await this.encryption.encryptInline(dek, selection, as);
+    openCiphertextSyncWindow();
     editor.replaceSelection(result.snippet);
     new Notice(as === "fence" ? t("notice.encryptedFence") : t("notice.encryptedInline"));
     this.log.info("selection_encrypted", { path: file.path, as });
@@ -1808,6 +1809,9 @@ export default class SealedNotePlugin extends Plugin {
       this.log.info("selection_decrypted_to_clipboard", { path: file.path });
       return;
     }
+    // The replacement INTERSECTS the ciphertext regions the guard protects:
+    // open the sync window so our own intended rewrite passes the filters.
+    openCiphertextSyncWindow();
     editor.replaceSelection(plain);
     new Notice(t("notice.decrypted"), 6000);
     // A decrypted FENCE leaves plaintext inside an encrypted_txt block. The

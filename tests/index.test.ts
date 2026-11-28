@@ -822,6 +822,65 @@ test("guard: plain notes are untouched by the filter", async () => {
   assert.equal(tr.docChanged, true, "typing into a plain note works");
 });
 
+test("guard: sealed ciphertext ranges are found exactly", async () => {
+  const { sealedCipherRanges } = await import("../src/editor/ciphertext-guard");
+  const cipher = "sn1." + "A".repeat(60);
+  const doc = `intro\n\n\`\`\`encrypted_txt\n${cipher}\n\`\`\`\n\nlive \`sn1.${"B".repeat(45)}\` pill\n\nplain line\n`;
+  const ranges = sealedCipherRanges(doc);
+  assert.equal(ranges.length, 2, "one fence + one inline payload");
+  const fence = ranges[0]!;
+  assert.equal(doc.slice(fence.from, fence.to).includes(cipher), true, "fence range covers the ciphertext");
+  assert.equal(doc.slice(fence.from, fence.from + 3), "```", "fence range starts at the opening fence");
+  const inline = ranges[1]!;
+  assert.equal(doc.slice(inline.from, inline.to).includes("sn1.BBBB"), true, "inline payload covered");
+
+  // An empty pending seal stays editable (nothing is at risk yet).
+  assert.equal(sealedCipherRanges("```encrypted_txt\n\n```\n").length, 0, "empty block: no protected range");
+  // A hand-typed plaintext block is NOT protected - the user must keep typing.
+  assert.equal(sealedCipherRanges("```encrypted_txt\nmy draft\n```\n").length, 0, "plaintext block stays editable");
+  // Unterminated fence (mid-typing) still protects existing ciphertext.
+  assert.equal(sealedCipherRanges(`x\n\`\`\`sealed\n${cipher}`).length, 1, "open fence still guards the payload");
+  // No payloads at all: zero scan cost paths.
+  assert.equal(sealedCipherRanges("# nothing here\n").length, 0);
+});
+
+test("guard: ciphertext in a plain note survives stray keystrokes", async () => {
+  const { ciphertextGuard } = await import("../src/editor/ciphertext-guard");
+  const { EditorState, Transaction } = await import("@codemirror/state");
+  const cipher = "sn1." + "C".repeat(60);
+  const doc = `intro line\n\n\`\`\`encrypted_txt\n${cipher}\n\`\`\`\n\noutro line\n`;
+  const fenceStart = doc.indexOf("```encrypted_txt");
+  const state = EditorState.create({ doc, extensions: ciphertextGuard() });
+
+  // A keystroke INSIDE the ciphertext body: refused, byte-for-byte intact.
+  const poke = state.update({
+    changes: { from: fenceStart + 25, to: fenceStart + 26, insert: "X" },
+    annotations: Transaction.userEvent.of("input"),
+  });
+  assert.equal(poke.docChanged, false, "typing over ciphertext is refused");
+  assert.equal(poke.state.doc.toString(), doc, "payload byte-for-byte intact");
+
+  // Deleting the whole fence: refused too.
+  const delFence = state.update({
+    changes: { from: fenceStart, to: fenceStart + 40 },
+    annotations: Transaction.userEvent.of("delete.content"),
+  });
+  assert.equal(delFence.docChanged, false, "backspace across the fence cannot destroy it");
+
+  // Editing the prose around the block: works normally.
+  const prose = state.update({
+    changes: { from: 0, insert: "more " },
+    annotations: Transaction.userEvent.of("input"),
+  });
+  assert.equal(prose.docChanged, true, "prose outside the block stays editable");
+
+  // A programmatic rewrite (plugin's own seal/decrypt, buffer sync): passes.
+  const swap = state.update({
+    changes: { from: fenceStart, to: fenceStart + 70, insert: "plaintext replacement" },
+  });
+  assert.equal(swap.docChanged, true, "no userEvent: the plugin's own write lands");
+});
+
 /* ------------------------------------------------------------------ */
 /* explorer badges (pure DOM helper against a hand-built tree)         */
 /* ------------------------------------------------------------------ */
