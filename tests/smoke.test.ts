@@ -84,6 +84,10 @@ function installDomShim(): void {
         return el;
       },
       createTreeWalker: () => ({ nextNode: () => null }),
+      createDocumentFragment: () => {
+        const f = makeEl();
+        return f;
+      },
       querySelector: () => null,
       // CodeMirror probes documentElement.style at module init for browser
       // detection; without this the real plugin import throws headless.
